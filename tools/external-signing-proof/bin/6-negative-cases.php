@@ -85,14 +85,12 @@ function proof_validate_pdf(string $pdf): array {
  * Run one negative case and check where it was rejected.
  *
  * @param callable():string $attempt performs complete() and returns the PDF; must throw when rejected at completion
- * @param callable(array):array{bool, array<string,mixed>}|null $extraCheck optional deterministic assertions on the outcome
  */
 function proof_case(
 	string $name,
 	string $expectation,
 	callable $attempt,
 	bool $expectRejectedAtCompletion,
-	?callable $extraCheck = null,
 ): array {
 	$outcome = ['case' => $name, 'expectation' => $expectation];
 	try {
@@ -112,11 +110,6 @@ function proof_case(
 
 	$observed = $outcome['rejected_at_completion'] === $expectRejectedAtCompletion
 		&& ($expectRejectedAtCompletion || $outcome['library_validation_valid'] === false);
-	if ($extraCheck !== null) {
-		[$extraOk, $extraData] = $extraCheck($outcome);
-		$outcome = array_merge($outcome, $extraData);
-		$observed = $observed && $extraOk;
-	}
 	$outcome['matched_expectation'] = $observed;
 
 	printf(
@@ -222,35 +215,21 @@ $cases[] = proof_case(
 	function () use ($basePdf, $altPdf, $certificatePem, $chainPem, $signerKeyPem): string {
 		$preparedA = proof_prepare_fresh($basePdf, $certificatePem, $chainPem);
 		$preparedB = proof_prepare_fresh($altPdf, $certificatePem, $chainPem);
+		// Assert on the ORIGINAL preparations used in the swap: the payloads
+		// must differ because the documents differ, independent of timestamps.
+		if ($preparedA->payload->inputBase64 === $preparedB->payload->inputBase64) {
+			proof_fail('Cross-lifecycle payloads are identical; the case is not exercising a real swap.');
+		}
+		printf(
+			"    payloads distinct       = yes (payload_a=%s payload_b=%s)\n",
+			substr(hash('sha256', $preparedA->payload->input()), 0, 12),
+			substr(hash('sha256', $preparedB->payload->input()), 0, 12),
+		);
 		$signatureForA = proof_sign_digest($preparedA->payload->input(), $signerKeyPem);
 
 		return Signer::externalSigner()->complete($preparedB->state, $signatureForA);
 	},
 	false,
-	function (array $outcome): array {
-		// Re-run the two preparations deterministically and assert the payloads
-		// differ, independent of timestamps: the documents themselves differ.
-		$preparedA = proof_prepare_fresh(
-			(string)file_get_contents(proof_path('rsa-base.pdf')),
-			(string)file_get_contents(proof_path('rsa-cert.pem')),
-			[(string)file_get_contents(proof_path('rsa-ca.pem'))],
-		);
-		$preparedB = proof_prepare_fresh(
-			(string)file_get_contents(proof_path('rsa-alt.pdf')),
-			(string)file_get_contents(proof_path('rsa-cert.pem')),
-			[(string)file_get_contents(proof_path('rsa-ca.pem'))],
-		);
-		$distinct = $preparedA->payload->inputBase64 !== $preparedB->payload->inputBase64;
-
-		return [
-			$distinct,
-			[
-				'payload_a_sha256' => hash('sha256', $preparedA->payload->input()),
-				'payload_b_sha256' => hash('sha256', $preparedB->payload->input()),
-				'payloads_distinct' => $distinct ? 'yes (deliberately different documents)' : 'NO - case is not deterministic',
-			],
-		];
-	},
 );
 
 $allMatched = ! in_array(false, array_column($cases, 'matched_expectation'), true);
