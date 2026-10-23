@@ -158,113 +158,47 @@ function proof_raw_sign_rsa(string $digest, string $keyPem, string $hashAlgorith
 }
 
 /**
+ * Resolve the OpenSSL 3 CLI used for independent verification and for the
+ * prehashed ECDSA signing operation.
+ */
+function proof_openssl_bin(): string {
+	$openssl = '/opt/homebrew/opt/openssl@3/bin/openssl';
+	if (is_executable($openssl)) {
+		return $openssl;
+	}
+
+	return '/usr/bin/openssl';
+}
+
+/**
  * Private-key operation for ECDSA with an already-computed digest:
- * pure PHP P-256 ECDSA over the digest (no re-hash), DER r||s output.
+ * `openssl pkeyutl -sign` treats the input of an EC key as a pre-hashed
+ * digest and signs it directly (DER r||s). No second hash is applied.
  */
 function proof_raw_sign_ecdsa(string $digest, string $keyPem): string {
-	$key = openssl_pkey_get_private($keyPem);
-	if ($key === false) {
-		proof_fail('Could not load the proof EC private key.');
-	}
-	$details = openssl_pkey_get_details($key);
-	if ($details === false || ($details['ec']['curve_name'] ?? '') !== 'prime256v1') {
-		proof_fail('Proof ECDSA path requires a prime256v1 key.');
-	}
-
-	$p = gmp_init('ffffffff00000001000000000000000000000000ffffffffffffffffffffffff', 16);
-	$n = gmp_init('ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551', 16);
-	$b = gmp_init('5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b', 16);
-	$gx = gmp_init('6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296', 16);
-	$gy = gmp_init('4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5', 16);
-	$d = gmp_init(bin2hex($details['ec']['d']), 16);
-
-	$z = gmp_init(bin2hex($digest), 16);
-
-	do {
-		do {
-			$k = gmp_random_range(gmp_init(1), gmp_sub($n, 1));
-			$point = proof_ec_point_mul($gx, $gy, $k, $p, $b);
-			$r = gmp_mod($point[0], $n);
-		} while (gmp_cmp($r, 0) === 0);
-		$kInverse = gmp_invert($k, $n);
-		if ($kInverse === false) {
-			proof_fail('gmp_invert(k, n) failed.');
-		}
-		$s = gmp_mod(gmp_mul($kInverse, gmp_add($z, gmp_mul($r, $d))), $n);
-	} while (gmp_cmp($s, 0) === 0);
-
-	return proof_der_sequence(proof_der_integer($r) . proof_der_integer($s));
-}
-
-function proof_ec_point_mul(GMP $x, GMP $y, GMP $k, GMP $p, GMP $b): array {
-	$result = null;
-	$addend = [$x, $y];
-	while (gmp_cmp($k, 0) > 0) {
-		if (gmp_testbit($k, 0)) {
-			$result = $result === null ? $addend : proof_ec_point_add($result, $addend, $p, $b);
-		}
-		$addend = proof_ec_point_add($addend, $addend, $p, $b);
-		$k = gmp_div_q($k, 2);
-	}
-	if ($result === null) {
-		proof_fail('EC point multiplication by zero.');
+	$digestFile = tempnam(sys_get_temp_dir(), 'proof-digest-');
+	file_put_contents($digestFile, $digest);
+	$keyFile = tempnam(sys_get_temp_dir(), 'proof-key-');
+	file_put_contents($keyFile, $keyPem);
+	chmod($keyFile, 0600);
+	$signatureFile = tempnam(sys_get_temp_dir(), 'proof-sig-');
+	$command = sprintf(
+		'%s pkeyutl -sign -inkey %s -in %s -out %s 2>&1',
+		escapeshellarg(proof_openssl_bin()),
+		escapeshellarg($keyFile),
+		escapeshellarg($digestFile),
+		escapeshellarg($signatureFile),
+	);
+	exec($command, $outputLines, $exitCode);
+	$signature = (string)file_get_contents($signatureFile);
+	unlink($digestFile);
+	unlink($keyFile);
+	unlink($signatureFile);
+	if ($exitCode !== 0 || $signature === '') {
+		proof_fail('openssl pkeyutl (prehashed ECDSA) failed: ' . implode("\n", $outputLines));
 	}
 
-	return $result;
-}
-
-function proof_ec_point_add(array $a, array $b, GMP $p, GMP $bParam): array {
-	[$x1, $y1] = $a;
-	[$x2, $y2] = $b;
-	if (gmp_cmp($x1, $x2) === 0) {
-		if (gmp_cmp(gmp_mod(gmp_add($y1, $y2), $p), gmp_init(0)) === 0) {
-			proof_fail('EC point at infinity during proof computation.');
-		}
-		// Doubling: slope = (3*x^2 + a) / (2*y) with a = p - 3 for P-256.
-		$aCurve = gmp_sub($p, gmp_init(3));
-		$numerator = gmp_mod(gmp_add(gmp_mul(gmp_init(3), gmp_mul($x1, $x1)), $aCurve), $p);
-		$denominatorInverse = gmp_invert(gmp_mod(gmp_mul(gmp_init(2), $y1), $p), $p);
-		if ($denominatorInverse === false) {
-			proof_fail('EC doubling: no modular inverse for 2*y.');
-		}
-		$slope = gmp_mod(gmp_mul($numerator, $denominatorInverse), $p);
-	} else {
-		$denominatorInverse = gmp_invert(gmp_mod(gmp_sub($x2, $x1), $p), $p);
-		if ($denominatorInverse === false) {
-			proof_fail('EC addition: no modular inverse for x2 - x1.');
-		}
-		$slope = gmp_mod(gmp_mul(gmp_sub($y2, $y1), $denominatorInverse), $p);
-	}
-	$x3 = gmp_mod(gmp_sub(gmp_sub(gmp_mul($slope, $slope), $x1), $x2), $p);
-	$y3 = gmp_mod(gmp_sub(gmp_mul($slope, gmp_sub($x1, $x3)), $y1), $p);
-
-	return [$x3, $y3];
-}
-
-function proof_der_integer(GMP $value): string {
-	$hex = gmp_strval($value, 16);
-	if (strlen($hex) % 2 === 1) {
-		$hex = '0' . $hex;
-	}
-	$bytes = hex2bin($hex);
-	if ((ord($bytes[0]) & 0x80) !== 0) {
-		$bytes = "\x00" . $bytes;
-	}
-
-	return "\x02" . proof_der_length(strlen($bytes)) . $bytes;
-}
-
-function proof_der_length(int $length): string {
-	if ($length < 0x80) {
-		return chr($length);
-	}
-	$bytes = ltrim(pack('N', $length), "\x00");
-
-	return chr(0x80 | strlen($bytes)) . $bytes;
-}
-
-function proof_der_sequence(string $content): string {
-	return "\x30" . proof_der_length(strlen($content)) . $content;
+	return $signature;
 }
 
 /**
@@ -315,10 +249,7 @@ function proof_extract_signatures(string $pdf): array {
  * @return array{ok: bool, output: string}
  */
 function proof_openssl_cms_verify(string $cmsDer, string $coveredContent): array {
-	$openssl = '/opt/homebrew/opt/openssl@3/bin/openssl';
-	if (! is_executable($openssl)) {
-		$openssl = '/usr/bin/openssl';
-	}
+	$openssl = proof_openssl_bin();
 	$cmsFile = tempnam(sys_get_temp_dir(), 'proof-cms-');
 	$contentFile = tempnam(sys_get_temp_dir(), 'proof-content-');
 	file_put_contents($cmsFile, $cmsDer);

@@ -47,7 +47,7 @@ if (strlen($digest) !== $expectedDigestLength) {
 	proof_fail(sprintf('Digest length %d does not match %s (%d bytes).', strlen($digest), $payload['digestAlgorithm'], $expectedDigestLength));
 }
 
-$keyPem = (string)file_get_contents(proof_path("{$suffix}-key.pem"));
+$keyPem = (string)file_get_contents(proof_path("{$keyType}-key.pem"));
 $signature = $keyType === 'ec'
 	? proof_raw_sign_ecdsa($digest, $keyPem)
 	: proof_raw_sign_rsa($digest, $keyPem, $payload['digestAlgorithm']);

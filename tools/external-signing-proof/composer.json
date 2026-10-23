@@ -6,7 +6,6 @@
     "require": {
         "php": ">=8.2",
         "ext-openssl": "*",
-        "ext-gmp": "*",
         "signerphp/pdf-signer": "dev-main#f27e4064be107b8a662f370a9acdcecd786da9f7"
     },
     "repositories": [

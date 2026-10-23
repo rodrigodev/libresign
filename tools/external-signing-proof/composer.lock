@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "602f7fd125f703bf56c11221ccdc23cf",
+    "content-hash": "12a298ffc955f10d132dac0fc2232637",
     "packages": [
         {
             "name": "signerphp/pdf-core",
@@ -187,8 +187,7 @@
     "prefer-lowest": false,
     "platform": {
         "php": ">=8.2",
-        "ext-openssl": "*",
-        "ext-gmp": "*"
+        "ext-openssl": "*"
     },
     "platform-dev": {},
     "platform-overrides": {

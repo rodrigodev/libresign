@@ -19,8 +19,9 @@ composer install          # or: ./run-proof.sh (installs on first run)
 ./run-proof.sh
 ```
 
-Requirements: PHP >= 8.3 with `ext-openssl` and `ext-gmp`, Composer, and an
-`openssl` CLI (OpenSSL 3 preferred; LibreSSL works).
+Requirements: PHP >= 8.3 with `ext-openssl`, Composer, and an OpenSSL 3 CLI
+(the ECDSA pre-hashed signing op uses `openssl pkeyutl`; tested with OpenSSL
+3.6.4). No GMP and no other PHP extensions are required.
 
 Exit code: `0` = every stage passed, non-zero = the first failing stage.
 All artifacts (keys, certs, PDFs, signatures, exported state) are written to
@@ -31,17 +32,24 @@ synthetic, generated locally per run, and no signing provider is contacted.
 
 | Stage | Command | Proof target |
 |---|---|---|
+| 0 | `0-setup.php` | Generates ALL synthetic artifacts (CA + leaf cert + private key per key type, an "other" wrong key, two distinct base PDFs) in their own process |
 | A | `1-prepare.php`, `2-external-sign.php`, `3-complete.php`, `4-validate.php` | Real lifecycle: prepare with public cert only → payload is a **pre-computed digest** → private-key op in a separate process → complete in a new process → library validation **and independent `openssl cms -verify`** agree |
 | B | `5-second-signature.php` | The whole lifecycle repeated on the signed PDF; **both** signatures validate |
 | C | stages A with `ec` | Same lifecycle with EC P-256 (DER `r‖s` output, as `SignatureEncoding::EcdsaDer` requires) |
-| D | `6-negative-cases.php` | Wrong key / empty / garbage signatures, corrupted state, tampered state with recomputed checksum, cross-lifecycle signature — and **where** each is rejected |
+| D | `6-negative-cases.php` | Wrong key / empty / garbage signatures, corrupted state, tampered state with recomputed checksum, cross-lifecycle signature with deliberately distinct documents — and **where** each is rejected |
 
-Stage separation: `1-prepare` never sees the private key (only the public
-certificate and chain); `2-external-sign` reads only the exported payload and
-performs the private-key op — for RSA, RSASSA-PKCS1-v1_5 over a DER
-`DigestInfo` of the already-computed digest (no second hash); `3-complete`
-runs in a fresh PHP process with only the opaque state string and the raw
-signature bytes.
+Stage separation is process separation plus API input separation, and the
+two must not be confused:
+
+- `0-setup` generates the private keys in its own process.
+- `1-prepare` loads only the input PDF, the public certificate and the
+  public chain. It never reads a private key (API input separation).
+- `2-external-sign` loads only the private key and the exported payload.
+- `3-complete` runs in a fresh PHP process with only the opaque state string
+  and the raw signature bytes.
+
+These are separate OS processes, not security sandboxes: nothing here
+enforces OS-level access isolation, and the proof does not claim it.
 
 ## Cryptographic findings (observed on the pinned commit)
 
@@ -54,6 +62,10 @@ signature bytes.
   (RSA/EC), invalid or checksum-failing state, and a CMS that exceeds the
   reserved `/Contents` placeholder. A signature from a **different key** or
   random garbage **is embedded** and only fails at validation time.
+- The EC private-key op uses `openssl pkeyutl -sign` on the raw digest: for
+  EC keys OpenSSL treats the input as a pre-hashed digest (no re-hash) and
+  emits DER `r‖s`, matching `SignatureEncoding::EcdsaDer`. The RSA op is
+  RSASSA-PKCS1-v1_5 over a DER `DigestInfo` via `openssl_private_encrypt`.
 - State checksum is unkeyed SHA-256 (`hash('sha256', json_encode(payload))`,
   compared with `hash_equals`): detects accidental corruption, does **not**
   authenticate state. `6-negative-cases.php` case

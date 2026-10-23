@@ -10,11 +10,15 @@ declare(strict_types=1);
 /**
  * Stage 1 - PREPARE.
  *
- * Creates the synthetic identity and the base PDF, then runs the real
- * SignerPHP\PdfSigner prepare step using ONLY the public certificate (the
- * private key never touches this stage's inputs and is never persisted into
- * the prepared state). Exports the cryptographic payload and the opaque
- * prepared state for the following stages.
+ * Runs the real SignerPHP\PdfSigner prepare step. This stage loads ONLY:
+ * - the input PDF;
+ * - the public signer certificate;
+ * - the public certificate chain.
+ *
+ * It never reads a private key: identity generation happens in stage 0, in a
+ * separate process. The private key is never persisted into the prepared
+ * state. Exports the cryptographic payload and the opaque prepared state for
+ * the following stages.
  *
  * Usage: php bin/1-prepare.php <rsa|ec> [suffix] [inputPdfPath]
  * Exit codes: 0 = prepared, 1 = failure.
@@ -26,24 +30,21 @@ require __DIR__ . '/../vendor/autoload.php';
 
 $keyType = $argv[1] ?? 'rsa';
 $suffix = $argv[2] ?? $keyType;
-$inputPdfPath = $argv[3] ?? null;
+$inputPdfPath = $argv[3] ?? proof_path("{$keyType}-base.pdf");
 if (! in_array($keyType, ['rsa', 'ec'], true)) {
 	proof_fail("Key type must be 'rsa' or 'ec', got '{$keyType}'.");
 }
+if (! is_file(proof_path("{$keyType}-cert.pem"))) {
+	proof_fail('Setup artifacts missing. Run: php bin/0-setup.php');
+}
 
-$identity = proof_generate_identity($keyType);
-file_put_contents(proof_path("{$suffix}-ca.pem"), $identity['caPem']);
-file_put_contents(proof_path("{$suffix}-cert.pem"), $identity['certPem']);
-file_put_contents(proof_path("{$suffix}-key.pem"), $identity['keyPem']);
-
-$pdf = $inputPdfPath !== null
-	? (string)file_get_contents($inputPdfPath)
-	: proof_make_pdf('BT /F1 24 Tf 72 700 Td (External signing proof - issue 8354) Tj ET');
-file_put_contents(proof_path("{$suffix}-base.pdf"), $pdf);
+$certificatePem = (string)file_get_contents(proof_path("{$keyType}-cert.pem"));
+$chainPem = [(string)file_get_contents(proof_path("{$keyType}-ca.pem"))];
+$pdf = (string)file_get_contents($inputPdfPath);
 
 $prepared = SignerPHP\PdfSigner\Presentation\Signer::externalSigner()
 	->withPdfContent($pdf)
-	->withCertificate($identity['certPem'], [$identity['caPem']])
+	->withCertificate($certificatePem, $chainPem)
 	->withMetadata(new SignerPHP\PdfSigner\Application\DTO\SignatureMetadataDto(
 		reason: 'LibreSign issue 8354 external-signing lifecycle proof',
 		location: 'Isolated fork proof',
@@ -59,7 +60,7 @@ proof_export_prepared($prepared, $suffix);
 $payload = proof_read_payload($suffix);
 $digestBytes = strlen((string)base64_decode($payload['inputBase64'], true));
 
-echo "Stage 1 PREPARE ({$suffix}, key={$keyType})\n";
+echo "Stage 1 PREPARE ({$suffix}, key={$keyType}, input={$inputPdfPath})\n";
 echo "  payload.inputType        = {$payload['inputType']}\n";
 echo "  payload.digestAlgorithm  = {$payload['digestAlgorithm']}\n";
 echo "  payload.signatureAlgorithm = {$payload['signatureAlgorithm']}\n";

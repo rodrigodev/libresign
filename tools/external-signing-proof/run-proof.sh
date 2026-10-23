@@ -25,6 +25,10 @@ if [ ! -f vendor/autoload.php ]; then
     composer install --no-interaction --no-progress
 fi
 
+echo "== Stage 0: setup (identities and PDFs, separate process) =="
+php bin/0-setup.php
+
+echo
 echo "== Stage A: RSA lifecycle across separate processes =="
 php bin/1-prepare.php rsa
 php bin/2-external-sign.php rsa
