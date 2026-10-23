@@ -1,0 +1,198 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "602f7fd125f703bf56c11221ccdc23cf",
+    "packages": [
+        {
+            "name": "signerphp/pdf-core",
+            "version": "v0.1.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/SignerPHP/pdf-core.git",
+                "reference": "5b2e95ff62fbf4927c3a391e7f35f6570d517d7b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/SignerPHP/pdf-core/zipball/5b2e95ff62fbf4927c3a391e7f35f6570d517d7b",
+                "reference": "5b2e95ff62fbf4927c3a391e7f35f6570d517d7b",
+                "shasum": ""
+            },
+            "require": {
+                "ext-ctype": "*",
+                "ext-fileinfo": "*",
+                "ext-zlib": "*",
+                "php": "^8.2"
+            },
+            "require-dev": {
+                "laravel/pint": "^1.20",
+                "pestphp/pest": "^3.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-main": "0.1.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "SignerPHP\\PdfCore\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Jeidison Farias"
+                }
+            ],
+            "description": "Standalone PDF parsing, manipulation and incremental serialization library",
+            "homepage": "https://github.com/SignerPHP/pdf-core",
+            "keywords": [
+                "AcroForm",
+                "incremental-update",
+                "object-stream",
+                "parser",
+                "pdf",
+                "xref"
+            ],
+            "support": {
+                "issues": "https://github.com/SignerPHP/pdf-core/issues",
+                "source": "https://github.com/SignerPHP/pdf-core"
+            },
+            "time": "2026-09-14T15:11:36+00:00"
+        },
+        {
+            "name": "signerphp/pdf-signer",
+            "version": "dev-main",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/SignerPHP/pdf-signer.git",
+                "reference": "f27e4064be107b8a662f370a9acdcecd786da9f7"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/SignerPHP/pdf-signer/zipball/f27e4064be107b8a662f370a9acdcecd786da9f7",
+                "reference": "f27e4064be107b8a662f370a9acdcecd786da9f7",
+                "shasum": ""
+            },
+            "require": {
+                "ext-curl": "*",
+                "ext-fileinfo": "*",
+                "ext-openssl": "*",
+                "ext-zlib": "*",
+                "php": "^8.2",
+                "signerphp/pdf-core": "^0.1.1"
+            },
+            "require-dev": {
+                "deptrac/deptrac": "^4.6",
+                "infection/infection": "^0.29",
+                "laravel/pint": "^1.20",
+                "pestphp/pest": "^3.0",
+                "roave/security-advisories": "dev-latest",
+                "symfony/var-dumper": "^6.4.2",
+                "vimeo/psalm": "^6.15"
+            },
+            "default-branch": true,
+            "bin": [
+                "bin/signer-sign",
+                "bin/signer-inspect",
+                "bin/signer-doctor"
+            ],
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "SignerPHP\\PdfSigner\\": "src/"
+                }
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "SignerPHP\\PdfSigner\\Tests\\": "tests/"
+                }
+            },
+            "scripts": {
+                "tests": [
+                    "vendor/bin/pest --configuration phpunit.xml tests"
+                ],
+                "tests:coverage": [
+                    "vendor/bin/pest --configuration phpunit.xml tests --coverage --min=98.5"
+                ],
+                "pint:fix": [
+                    "vendor/bin/pint"
+                ],
+                "pint:check": [
+                    "vendor/bin/pint --test"
+                ],
+                "security:audit": [
+                    "composer audit --no-interaction"
+                ],
+                "psalm": [
+                    "vendor/bin/psalm --no-progress"
+                ],
+                "deptrac": [
+                    "vendor/bin/deptrac analyse --no-progress"
+                ],
+                "infection": [
+                    "vendor/bin/infection --threads=max --min-msi=65 --min-covered-msi=70"
+                ],
+                "quality:all": [
+                    "@pint:check",
+                    "@security:audit",
+                    "@tests:coverage",
+                    "@psalm",
+                    "@deptrac",
+                    "@infection"
+                ]
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Jeidison Farias"
+                }
+            ],
+            "description": "Open-source PHP library for PDF digital signing with multiple signatures, RFC3161 timestamping, PAdES profiles, and PDF protection",
+            "homepage": "https://github.com/SignerPHP/pdf-signer",
+            "keywords": [
+                "digital-signature",
+                "docmdp",
+                "icp-brasil",
+                "multiple-signatures",
+                "pades",
+                "pdf",
+                "php",
+                "rfc3161",
+                "signer",
+                "timestamp"
+            ],
+            "support": {
+                "source": "https://github.com/SignerPHP/pdf-signer/tree/main",
+                "issues": "https://github.com/SignerPHP/pdf-signer/issues"
+            },
+            "time": "2026-10-05T02:25:26+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "dev",
+    "stability-flags": {
+        "signerphp/pdf-signer": 20
+    },
+    "prefer-stable": true,
+    "prefer-lowest": false,
+    "platform": {
+        "php": ">=8.2",
+        "ext-openssl": "*",
+        "ext-gmp": "*"
+    },
+    "platform-dev": {},
+    "platform-overrides": {
+        "php": "8.3"
+    },
+    "plugin-api-version": "2.9.0"
+}

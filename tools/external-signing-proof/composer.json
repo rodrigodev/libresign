@@ -1,0 +1,25 @@
+{
+    "name": "libresign/external-signing-proof",
+    "description": "Isolated proof of the signerphp/pdf-signer external prepare/complete lifecycle (LibreSign investigation #8354). Not production code.",
+    "type": "project",
+    "license": "AGPL-3.0-or-later",
+    "require": {
+        "php": ">=8.2",
+        "ext-openssl": "*",
+        "ext-gmp": "*",
+        "signerphp/pdf-signer": "dev-main#f27e4064be107b8a662f370a9acdcecd786da9f7"
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/SignerPHP/pdf-signer.git"
+        }
+    ],
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "config": {
+        "platform": {
+            "php": "8.3"
+        }
+    }
+}

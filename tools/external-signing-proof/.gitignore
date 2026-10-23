@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 rodrigodev
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Proof artifacts stay out of version control: dependencies, generated keys,
+# certificates, PDFs, signatures and exported prepared states are all runtime
+# output only.
+/vendor/
+/var/
