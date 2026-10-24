@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "069d1d02ff349c6aebd6486d0f41c9b3",
+    "content-hash": "abf1c858f12048e621866ce7873ede16",
     "packages": [
         {
             "name": "cweagans/composer-configurable-plugin",
@@ -2175,13 +2175,13 @@
         }
     ],
     "aliases": [],
-    "minimum-stability": "dev",
+    "minimum-stability": "stable",
     "stability-flags": {
         "nextcloud/ocp": 20,
         "roave/security-advisories": 20,
         "signerphp/pdf-signer": 20
     },
-    "prefer-stable": true,
+    "prefer-stable": false,
     "prefer-lowest": false,
     "platform": {},
     "platform-dev": {},

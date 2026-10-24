@@ -68,8 +68,6 @@
 			"url": "https://github.com/SignerPHP/pdf-signer.git"
 		}
 	},
-	"minimum-stability": "dev",
-	"prefer-stable": true,
 	"require": {
 		"cweagans/composer-patches": "^2.0",
 		"signerphp/pdf-signer": "dev-main#f27e4064be107b8a662f370a9acdcecd786da9f7"
