@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "abf1c858f12048e621866ce7873ede16",
+    "content-hash": "c81b12a994e5dd5b2694f64df0aac1c1",
     "packages": [
         {
             "name": "cweagans/composer-configurable-plugin",
@@ -191,7 +191,7 @@
         },
         {
             "name": "signerphp/pdf-signer",
-            "version": "dev-main",
+            "version": "v0.3.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/SignerPHP/pdf-signer.git",
@@ -220,7 +220,6 @@
                 "symfony/var-dumper": "^6.4.2",
                 "vimeo/psalm": "^6.15"
             },
-            "default-branch": true,
             "bin": [
                 "bin/signer-sign",
                 "bin/signer-inspect",
@@ -232,45 +231,7 @@
                     "SignerPHP\\PdfSigner\\": "src/"
                 }
             },
-            "autoload-dev": {
-                "psr-4": {
-                    "SignerPHP\\PdfSigner\\Tests\\": "tests/"
-                }
-            },
-            "scripts": {
-                "tests": [
-                    "vendor/bin/pest --configuration phpunit.xml tests"
-                ],
-                "tests:coverage": [
-                    "vendor/bin/pest --configuration phpunit.xml tests --coverage --min=98.5"
-                ],
-                "pint:fix": [
-                    "vendor/bin/pint"
-                ],
-                "pint:check": [
-                    "vendor/bin/pint --test"
-                ],
-                "security:audit": [
-                    "composer audit --no-interaction"
-                ],
-                "psalm": [
-                    "vendor/bin/psalm --no-progress"
-                ],
-                "deptrac": [
-                    "vendor/bin/deptrac analyse --no-progress"
-                ],
-                "infection": [
-                    "vendor/bin/infection --threads=max --min-msi=65 --min-covered-msi=70"
-                ],
-                "quality:all": [
-                    "@pint:check",
-                    "@security:audit",
-                    "@tests:coverage",
-                    "@psalm",
-                    "@deptrac",
-                    "@infection"
-                ]
-            },
+            "notification-url": "https://packagist.org/downloads/",
             "license": [
                 "MIT"
             ],
@@ -294,8 +255,8 @@
                 "timestamp"
             ],
             "support": {
-                "source": "https://github.com/SignerPHP/pdf-signer/tree/main",
-                "issues": "https://github.com/SignerPHP/pdf-signer/issues"
+                "issues": "https://github.com/SignerPHP/pdf-signer/issues",
+                "source": "https://github.com/SignerPHP/pdf-signer/tree/v0.3.0"
             },
             "time": "2026-10-05T02:25:26+00:00"
         }
@@ -2178,8 +2139,7 @@
     "minimum-stability": "stable",
     "stability-flags": {
         "nextcloud/ocp": 20,
-        "roave/security-advisories": 20,
-        "signerphp/pdf-signer": 20
+        "roave/security-advisories": 20
     },
     "prefer-stable": false,
     "prefer-lowest": false,

@@ -62,14 +62,8 @@
 			"OCA\\Libresign\\Tests\\Integration\\": "tests/php/Integration/"
 		}
 	},
-	"repositories": {
-		"signerphp-pdf-signer": {
-			"type": "vcs",
-			"url": "https://github.com/SignerPHP/pdf-signer.git"
-		}
-	},
 	"require": {
 		"cweagans/composer-patches": "^2.0",
-		"signerphp/pdf-signer": "dev-main#f27e4064be107b8a662f370a9acdcecd786da9f7"
+		"signerphp/pdf-signer": "^0.3.0"
 	}
 }
