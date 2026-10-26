@@ -86,6 +86,9 @@ final class LocalSignerClient {
 	/** Max bytes written to stdin per loop iteration. */
 	private const MAX_WRITE_PER_ITERATION = 262144;
 
+	/** Set when a termination attempt failed to confirm exit; no further cleanup attempts are made. */
+	private bool $cleanupExhausted = false;
+
 	public function __construct(
 		private string $pythonBinary,
 		private string $signerScript,
@@ -97,6 +100,14 @@ final class LocalSignerClient {
 		private ?\Closure $commandOverride = null,
 		/** TEST-ONLY: force the termination-capability probe (null = auto-detect). */
 		private ?bool $terminationSupport = null,
+		/**
+		 * TEST-ONLY fault-injection seam: replaces proc_get_status() INSIDE
+		 * terminateConfirmed() only. Receives the process resource and must
+		 * return the proc_get_status() array shape. Used to simulate a
+		 * status probe that never observes exit — an INJECTED confirmation
+		 * failure, clearly distinct from a real OS refusal to terminate.
+		 */
+		private ?\Closure $statusProbe = null,
 	) {
 	}
 
@@ -346,14 +357,14 @@ final class LocalSignerClient {
 				}
 
 				$read = [];
-				if ($stdoutOpen) {
+				if ($stdoutOpen && is_resource($stdout)) {
 					$read[] = $stdout;
 				}
-				if ($stderrOpen) {
+				if ($stderrOpen && is_resource($stderrPipe)) {
 					$read[] = $stderrPipe;
 				}
 				$write = [];
-				if ($stdinOpen && ! $stdinBroken) {
+				if ($stdinOpen && ! $stdinBroken && is_resource($stdin)) {
 					$write[] = $stdin;
 				}
 
@@ -543,13 +554,31 @@ final class LocalSignerClient {
 	 * Bounded, CONFIRMED termination of a still-running child: SIGTERM, a
 	 * bounded grace period polling for exit, SIGKILL escalation, then a
 	 * final bounded confirmation poll. Signal-call results are checked.
-	 * proc_close() runs only after exit is OBSERVED; if exit cannot be
-	 * confirmed within the bounded periods this method THROWS — it never
-	 * falls back to an unbounded wait and never presents cleanup as
-	 * guaranteed. Requires posix_kill (checked before launch).
+	 * proc_close() runs only after exit is OBSERVED.
+	 *
+	 * GUARANTEE AND ITS LIMIT: when exit IS observed, cleanup is bounded.
+	 * When exit CANNOT be confirmed within the bounded periods, this
+	 * method marks cleanup exhausted (no repeated attempts) and throws
+	 * `termination-unconfirmed`. That error is NOT guaranteed to be
+	 * delivered promptly: PHP destroys the process resource when the
+	 * reference leaves scope and its own destructor waits for the child
+	 * exactly like an explicit proc_close(). On macOS/Linux a delivered
+	 * SIGKILL always terminates the child, so destruction completes once
+	 * the kernel acts; but this client makes no promptness claim for the
+	 * unconfirmed path. The supported containment for that unsupported
+	 * environmental condition is the independent outer watchdog (which
+	 * kills by pid and never waits unboundedly). Requires posix_kill
+	 * (checked before launch).
 	 */
 	private function terminateConfirmed($process): void {
-		$status = proc_get_status($process);
+		if ($this->cleanupExhausted) {
+			// A previous attempt already failed to confirm termination.
+			// Repeated cleanup attempts would only compound the failure.
+			return;
+		}
+		$probe = $this->statusProbe
+			?? static fn ($proc): array => proc_get_status($proc);
+		$status = $probe($process);
 		if ($status['running'] === false) {
 			proc_close($process);
 
@@ -561,7 +590,7 @@ final class LocalSignerClient {
 		if ($sigtermSent) {
 			do {
 				usleep(20000);
-				$status = proc_get_status($process);
+				$status = $probe($process);
 			} while ($status['running'] && hrtime(true) < $graceDeadlineNs);
 		}
 
@@ -571,22 +600,23 @@ final class LocalSignerClient {
 			if ($sigkillSent) {
 				do {
 					usleep(20000);
-					$status = proc_get_status($process);
+					$status = $probe($process);
 				} while ($status['running'] && hrtime(true) < $killDeadlineNs);
 			}
 		}
 
 		if ($status['running']) {
-			// Defined behavior: give up LOUDLY instead of blocking or
-			// presenting cleanup as guaranteed. The child may leak; the
-			// operation remains uncertain either way. The reap is still
-			// attempted because PHP requires it to free the handle; the
-			// thrown error documents that exit was NOT confirmed.
-			proc_close($process);
+			// Unconfirmed: give up WITHOUT calling proc_close() (it can
+			// block waiting for the child) and WITHOUT retrying. PHP's own
+			// resource destruction may still wait for the kernel when the
+			// reference leaves scope — prompt error delivery is NOT
+			// guaranteed. The outer watchdog is the containment.
+			$this->cleanupExhausted = true;
 			throw new SignerProtocolException(
 				'could not CONFIRM the termination of the local signer child within the bounded'
-				. ' grace and kill periods; the child may still be running. This is a hard'
-				. ' environment failure, not a bounded cleanup guarantee.',
+				. ' grace and kill periods. This is an unsupported environmental condition:'
+				. ' error delivery may be delayed by PHP resource destruction, and the child'
+				. ' may still be running. The independent outer watchdog is the containment.',
 				self::REASON_TERMINATION_UNCONFIRMED,
 			);
 		}

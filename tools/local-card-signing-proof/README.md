@@ -81,7 +81,13 @@ outcome). All deadline arithmetic is monotonic; the termination grace
 period (2 s) and kill confirmation period (2 s) are separate bounded
 periods. Termination is CONFIRMED (SIGTERM → grace poll → SIGKILL →
 exit observed) and requires `posix_kill`; without it the client refuses
-to launch a child at all. Rejections carry stable reasons
+to launch a child at all. GUARANTEE LIMIT: when exit cannot be
+confirmed within the bounded periods, cleanup is marked exhausted (no
+repeated attempts) and `termination-unconfirmed` is thrown — but error
+delivery is NOT guaranteed to be prompt, because PHP resource
+destruction can wait for the kernel. The independent outer watchdog is
+the containment for that unsupported environmental condition.
+Rejections carry stable reasons
 (`REASON_*` on `SignerProtocolException`). Request validation is strict:
 unknown top-level keys, unknown payload keys and a null `simulation`
 are rejected. Diagnostics: the signer writes stderr; the harness
@@ -226,7 +232,22 @@ never parsed console output).
 
 ## Checks
 
-php-cs-fixer and Psalm were run against every PHP file added by this
-proof (full-project Psalm run: no errors); see the handoff report for
-the exact commands and results. The `tools/` PHP harness is NOT part of
-the application autoloader and is loaded explicitly by the test.
+Proof-specific Psalm analysis: the application's `psalm.xml` analyzes
+`lib/` ONLY, so a default application scan does NOT cover the proof.
+The targeted analysis instead uses a temporary proof-specific config
+(`psalm-proof.xml`, not committed) whose `projectFiles` are exactly the
+PHP the proof adds (`tools/local-card-signing-proof/harness/`,
+`tests/php/Integration/Tools/`) and whose `extraFiles` carry the
+dependencies needed to resolve the test base classes (app `lib/`,
+server `lib/`, server `tests/lib/`, the integration `TestCase` and the
+#9216 subprocess infrastructure). Run:
+
+```bash
+CI=1 vendor-bin/psalm/vendor/bin/psalm --no-cache --threads=4 \
+  -c psalm-proof.xml
+```
+
+php-cs-fixer runs over the same added paths. The `tools/` PHP harness
+is NOT part of the application autoloader and is loaded explicitly by
+the test. See the handoff reports for the recorded results, exit codes
+and any subset-scan diagnostics.

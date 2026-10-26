@@ -1006,6 +1006,115 @@ final class LocalCardSigningProofTest extends TestCase {
 	}
 
 	/**
+	 * FAULT-INJECTION REGRESSION for the unconfirmed-termination path.
+	 *
+	 * The status probe inside terminateConfirmed() is replaced by one
+	 * that NEVER observes exit — an INJECTED confirmation failure. The
+	 * real SIGTERM/SIGKILL still reach the real child pid. Expected:
+	 * `termination-unconfirmed` is thrown, the scenario stays bounded
+	 * inside the independent outer watchdog, cleanup is not retried, and
+	 * no signer survivor remains.
+	 *
+	 * This establishes: the client gives up after ONE bounded attempt and
+	 * reports the failure instead of retrying or claiming success. It
+	 * does NOT establish prompt error delivery on the unconfirmed path:
+	 * PHP resource destruction can still wait for the kernel. A REAL OS
+	 * refusal to terminate (SIGKILL not acting) is outside what this
+	 * proof can simulate or contain; the outer watchdog is the
+	 * containment for that environmental condition.
+	 */
+	public function testInjectedTerminationConfirmationFailureIsReportedBounded(): void {
+		if (! function_exists('pcntl_fork')) {
+			$this->markTestSkipped('pcntl is unavailable; the independent outer timeout cannot be provided.');
+		}
+		$runId = 'adv-unconfirmed-' . uniqid();
+		$adversarialScript = $this->adversarialScript;
+		$pythonBinary = $this->pythonBinary();
+		$childPid = pcntl_fork();
+		if ($childPid === -1) {
+			$this->markTestSkipped('pcntl_fork failed; the independent outer timeout cannot be provided.');
+		}
+		if ($childPid === 0) {
+			try {
+				$realPid = 0;
+				$probe = static function ($proc) use (&$realPid): array {
+					$real = proc_get_status($proc);
+					if ($real['running']) {
+						$realPid = $real['pid'];
+					}
+
+					return ['running' => true, 'pid' => $realPid ?: 999999];
+				};
+				$client = new LocalSignerClient(
+					$pythonBinary,
+					$adversarialScript,
+					null,
+					0.5,
+					commandOverride: static fn (string $subcommand): array => [
+						$pythonBinary,
+						'-B',
+						$adversarialScript,
+						'never_reads',
+						$runId,
+					],
+					statusProbe: $probe,
+				);
+				$credential = $this->credentialByRef('synthetic-rsa-leaf');
+				$pdf = $this->makePdf('fault injection, unconfirmed ' . $runId);
+				$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+				$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+				$started = microtime(true);
+				try {
+					$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+						$record->operationId,
+						$credential['credentialRef'],
+						$credential['certificateSha256'],
+						$prepared->upstream->payload,
+					));
+					$this->fail('an unconfirmable termination must be reported');
+				} catch (SignerProtocolException $exception) {
+					$this->assertSame(LocalSignerClient::REASON_TERMINATION_UNCONFIRMED, $exception->reason);
+				}
+				$elapsed = microtime(true) - $started;
+				$this->assertLessThan(15.0, $elapsed, 'the injected failure must surface inside a bounded window');
+				$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+				exit(0);
+			} catch (\Throwable $childFailure) {
+				file_put_contents(sys_get_temp_dir() . '/adv-child-' . $runId . '.err', (string)$childFailure);
+				exit(1);
+			}
+		}
+
+		// Independent outer watchdog, monotonic clock.
+		$outerDeadlineNs = hrtime(true) + self::OUTER_TIMEOUT_SECONDS * 1_000_000_000;
+		$childStatus = 0;
+		$reaped = false;
+		while (hrtime(true) < $outerDeadlineNs) {
+			$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
+			if ($waited === $childPid) {
+				$reaped = true;
+				break;
+			}
+			if ($waited === -1) {
+				break;
+			}
+			usleep(50000);
+		}
+		$this->assertTrue($reaped, 'the fault-injection scenario must finish inside the independent outer timeout');
+		$this->assertTrue(pcntl_wifexited($childStatus), 'the fault-injection test child must exit normally, not by signal');
+		$this->assertSame(0, pcntl_wexitstatus($childStatus));
+
+		// Cleanup + evidence: no signer survivor for this run id.
+		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $survivors, $pgrepExit);
+		foreach ($survivors as $pid) {
+			if (ctype_digit($pid)) {
+				posix_kill((int)$pid, 9); // SIGKILL
+			}
+		}
+		$this->assertSame(1, $pgrepExit, 'ordinary child processes must not survive: ' . implode(', ', $survivors));
+	}
+
+	/**
 	 * WATCHDOG META-REGRESSION: the isolation machinery itself must not
 	 * produce false results. All four cases run through the SAME
 	 * runIsolatedScenario() machinery the adversarial tests use, inside
