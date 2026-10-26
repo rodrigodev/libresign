@@ -471,7 +471,10 @@ def cmd_sign(args):
         sys.stdout.flush()
         return 0
     if scenario == "oversized-response":
-        sys.stdout.write("x" * (MAX_REQUEST_BYTES * 4) + "\n")
+        # 2 MiB: safely above the harness's 1 MiB cumulative response cap
+        # (MAX_REQUEST_BYTES * 4 = 256 KiB was BELOW it and never exercised
+        # the size rejection).
+        sys.stdout.write("x" * (2 * 1024 * 1024) + "\n")
         sys.stdout.flush()
         return 0
 

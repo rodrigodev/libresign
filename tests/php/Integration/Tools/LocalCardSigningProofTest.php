@@ -47,11 +47,15 @@ use SignerPHP\PdfSigner\Application\DTO\SigningOptionsDto;
  * are TEST identities, not Portuguese government certificates. This proof
  * does NOT establish compatibility with the physical Citizen Card.
  *
- * Reused #9216 guarantees (unchanged): preparation-input binding,
- * DocMDP gate, signer identity resolved from the CMS SignerInfo,
- * completed-revision coverage, cryptographic validity and prior-signature
- * retention. Timestamp/LTV support and certificate trust assessment are
- * OUT OF SCOPE — this proves cryptographic validity only.
+ * Outcome classification (applied automatically by ProofOperationRecord):
+ * - a documented PRE-SIGN rejection (validated before key access) closes
+ *   the operation as REJECTED — no signature can exist;
+ * - ANY unusable response, crash, timeout or correlation failure observed
+ *   AFTER submission is UNCERTAIN: the signer may have used the key. The
+ *   operation is never resent. Protocol diagnostics do not prove that
+ *   signing did not occur;
+ * - cryptographic validation failure at completion closes the operation
+ *   as FAILED: no bytes are returned or published.
  *
  * The makePdf/extractSignatures/openssl-verification helpers are
  * deliberately copied from ExternalPdfSigningServiceTest so that the
@@ -64,7 +68,10 @@ final class LocalCardSigningProofTest extends TestCase {
 	private ITempManager $tempManager;
 	private string $toolsDirectory;
 	private string $fixturesDirectory;
+	private string $adversarialScript;
 	private ?array $credentials = null;
+	/** Independent outer timeout (seconds) for adversarial process tests. */
+	private const OUTER_TIMEOUT_SECONDS = 20;
 
 	#[\Override]
 	public function setUp(): void {
@@ -81,6 +88,7 @@ final class LocalCardSigningProofTest extends TestCase {
 		$this->tempManager = \OCP\Server::get(ITempManager::class);
 		$this->toolsDirectory = dirname(__DIR__, 4) . '/tools/local-card-signing-proof';
 		$this->fixturesDirectory = $this->toolsDirectory . '/fixtures';
+		$this->adversarialScript = $this->toolsDirectory . '/signer/adversarial_children.py';
 
 		// The proof harness lives under tools/ by design (isolation from
 		// production code); it is NOT part of the composer autoload map,
@@ -111,7 +119,7 @@ final class LocalCardSigningProofTest extends TestCase {
 		if (! is_file($this->pythonBinary())) {
 			$this->markTestSkipped(
 				'Python environment for the local signer not found. Run:'
-				. ' python3 -m venv .venv && .venv/bin/pip install cryptography'
+				. ' python3 -m venv .venv && .venv/bin/pip install -r signer/requirements.txt'
 				. ' inside tools/local-card-signing-proof/',
 			);
 		}
@@ -181,9 +189,10 @@ final class LocalCardSigningProofTest extends TestCase {
 
 	/**
 	 * Full positive lifecycle through REAL services and a REAL subprocess:
-	 * discovery -> prepare -> external signature -> correlation -> complete.
+	 * discovery -> prepare -> external signature (via the coordinator,
+	 * which applies outcome transitions automatically) -> correlation.
 	 *
-	 * @return array{record: ProofOperationRecord, client: LocalSignerClient, prepared: \OCA\Libresign\Service\Signature\PreparedExternalOperation, credential: array, signedBySigner: \LibreSign\Tools\LocalCardSigningProof\SignerResponse}
+	 * @return array{record: ProofOperationRecord, prepared: \OCA\Libresign\Service\Signature\PreparedExternalOperation, credential: array, signedBySigner: \LibreSign\Tools\LocalCardSigningProof\SignerResponse}
 	 */
 	private function runLifecycle(string $credentialRef, string $pdf, ?array $simulation = null): array {
 		$client = $this->client();
@@ -191,25 +200,37 @@ final class LocalCardSigningProofTest extends TestCase {
 
 		$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
 		$record = new ProofOperationRecord('proof-op-' . uniqid(), $credentialRef);
-		$record->markSent();
 
-		$signedBySigner = $client->signPreparedOperation(
+		$signedBySigner = $record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
 			$record->operationId,
 			$credentialRef,
 			$credential['certificateSha256'],
 			$prepared->upstream->payload,
 			$simulation,
-		);
+		));
 		$this->assertSame($record->operationId, $signedBySigner->operationId);
 		$this->assertSame($credentialRef, $signedBySigner->credentialRef);
 
 		return [
 			'record' => $record,
-			'client' => $client,
 			'prepared' => $prepared,
 			'credential' => $credential,
 			'signedBySigner' => $signedBySigner,
 		];
+	}
+
+	/**
+	 * Guarded completion through the coordinator: the real completion
+	 * service runs inside completeWith(), so a second attempt is refused
+	 * BEFORE the service is invoked again.
+	 */
+	private function completeGuarded(array $lifecycle, string $pdf): string {
+		return $lifecycle['record']->completeWith(fn (): string => $this->service->complete(
+			$lifecycle['prepared'],
+			$lifecycle['signedBySigner']->signature,
+			$pdf,
+			$lifecycle['credential']['certificatePem'],
+		));
 	}
 
 	public function testRsaLifecycleThroughLocalSignerProcess(): void {
@@ -217,13 +238,9 @@ final class LocalCardSigningProofTest extends TestCase {
 		$lifecycle = $this->runLifecycle('synthetic-rsa-leaf', $pdf);
 		$this->assertSame('rsa-pkcs1', $lifecycle['signedBySigner']->signatureEncoding);
 
-		$completed = $this->service->complete(
-			$lifecycle['prepared'],
-			$lifecycle['signedBySigner']->signature,
-			$pdf,
-			$lifecycle['credential']['certificatePem'],
-		);
-		$lifecycle['record']->markCompleted();
+		$completed = $this->completeGuarded($lifecycle, $pdf);
+		$this->assertSame(ProofOperationRecord::STATE_COMPLETED, $lifecycle['record']->getState());
+		$this->assertSame(1, $lifecycle['record']->getCompletionInvocations());
 
 		$signatures = $this->extractSignatures($completed);
 		$this->assertCount(1, $signatures);
@@ -242,13 +259,8 @@ final class LocalCardSigningProofTest extends TestCase {
 		$der = $lifecycle['signedBySigner']->signature;
 		$this->assertSame(0x30, ord($der[0]), 'the harness must normalize r||s to DER before completion');
 
-		$completed = $this->service->complete(
-			$lifecycle['prepared'],
-			$der,
-			$pdf,
-			$lifecycle['credential']['certificatePem'],
-		);
-		$lifecycle['record']->markCompleted();
+		$completed = $this->completeGuarded($lifecycle, $pdf);
+		$this->assertSame(ProofOperationRecord::STATE_COMPLETED, $lifecycle['record']->getState());
 
 		$signatures = $this->extractSignatures($completed);
 		$this->assertCount(1, $signatures);
@@ -344,22 +356,10 @@ final class LocalCardSigningProofTest extends TestCase {
 		$pdf = $this->makePdf('Local card proof, two signatures');
 
 		$first = $this->runLifecycle('synthetic-rsa-leaf', $pdf);
-		$signedOnce = $this->service->complete(
-			$first['prepared'],
-			$first['signedBySigner']->signature,
-			$pdf,
-			$first['credential']['certificatePem'],
-		);
-		$first['record']->markCompleted();
+		$signedOnce = $this->completeGuarded($first, $pdf);
 
 		$second = $this->runLifecycle('synthetic-rsa-leaf', $signedOnce);
-		$signedTwice = $this->service->complete(
-			$second['prepared'],
-			$second['signedBySigner']->signature,
-			$signedOnce,
-			$second['credential']['certificatePem'],
-		);
-		$second['record']->markCompleted();
+		$signedTwice = $this->completeGuarded($second, $signedOnce);
 
 		$firstSignatures = $this->extractSignatures($signedOnce);
 		$both = $this->extractSignatures($signedTwice);
@@ -375,37 +375,42 @@ final class LocalCardSigningProofTest extends TestCase {
 
 	/**
 	 * Reader/card absence, user cancellation and PIN scenarios are
-	 * protocol-level rejections BEFORE any key access. No PIN value is
+	 * DOCUMENTED PRE-SIGN rejections (validated before key access): the
+	 * coordinator closes them as REJECTED automatically. No PIN value is
 	 * ever set, stored or transmitted — the scenarios are named codes.
 	 */
-	public function testReaderCancellationAndPinScenariosAreProtocolRejections(): void {
+	public function testReaderCancellationAndPinScenariosCloseAsRejected(): void {
 		$pdf = $this->makePdf('Local card proof, reader failures');
-		foreach ([
-			'no-reader' => 'no-reader',
-			'cancelled' => 'cancelled',
-			'pin-rejected' => 'pin-rejected',
-			'pin-blocked' => 'pin-blocked',
-		] as $scenario => $expectedCode) {
+		foreach (['no-reader', 'cancelled', 'pin-rejected', 'pin-blocked'] as $scenario) {
 			$client = $this->client();
 			$credential = $this->credentialByRef('synthetic-rsa-leaf');
 			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
 			$record = new ProofOperationRecord('proof-op-' . uniqid(), $credential['credentialRef']);
-			$record->markSent();
 
 			try {
-				$client->signPreparedOperation(
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
 					$record->operationId,
 					$credential['credentialRef'],
 					$credential['certificateSha256'],
 					$prepared->upstream->payload,
 					['scenario' => $scenario],
-				);
+				));
 				$this->fail("scenario $scenario must be rejected by the protocol");
 			} catch (SignerErrorException $exception) {
-				$this->assertSame($expectedCode, $exception->errorCode);
+				$this->assertSame($scenario, $exception->errorCode);
 			}
-			// No signature exists; the operation stays open (NOT completed,
-			// NOT retried here). The prepared state is simply discarded.
+			$this->assertSame(
+				ProofOperationRecord::STATE_REJECTED,
+				$record->getState(),
+				"a documented pre-sign rejection ($scenario) must close the operation automatically",
+			);
+			try {
+				$record->completeWith(fn (): string => 'never');
+				$this->fail('a rejected operation must not be completable');
+			} catch (\LogicException) {
+				$this->addToAssertionCount(1);
+			}
+			$this->assertSame(0, $record->getCompletionInvocations());
 		}
 	}
 
@@ -427,77 +432,411 @@ final class LocalCardSigningProofTest extends TestCase {
 		);
 
 		$prepared = $this->service->prepare($this->buildContext($pdf, $freshCredential));
+		$record = new ProofOperationRecord('proof-op-replaced', $freshCredential['credentialRef']);
 		try {
-			$this->client()->signPreparedOperation(
-				'proof-op-replaced',
+			$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $this->client()->signPreparedOperation(
+				$record->operationId,
 				$freshCredential['credentialRef'],
 				$credential['certificateSha256'],
 				$prepared->upstream->payload,
-			);
+			));
 			$this->fail('a replaced credential must be rejected by fingerprint');
 		} catch (SignerErrorException $exception) {
 			$this->assertSame('fingerprint-mismatch', $exception->errorCode);
 		}
+		$this->assertSame(ProofOperationRecord::STATE_REJECTED, $record->getState());
 	}
 
 	/**
-	 * A signer that hangs is killed at the harness timeout. The outcome is
-	 * UNCERTAIN (the signature may exist) and the harness record forbids
-	 * any automatic retry.
+	 * TIMEOUT SHAPES: a silent hang, an answer-then-hang and an ignored
+	 * SIGTERM all end as UNCERTAIN within the deadline, the child is
+	 * actually reaped, and the coordinator refuses any resend.
 	 */
-	public function testTimeoutTerminatesProcessAndOperationIsNeverRetried(): void {
-		// Both timeout shapes must be classified as UNCERTAIN: a child
-		// that never outputs, and a child that ANSWERS and then refuses
-		// to exit. The whole process lifetime is covered by the timeout.
-		foreach (['hang', 'output-then-hang'] as $scenario) {
-			$pdf = $this->makePdf('Local card proof, hung signer (' . $scenario . ')');
-			$client = $this->client(1.0);
+	public function testTimeoutShapesTerminateBoundedAndAreUncertain(): void {
+		foreach (['never_reads', 'valid_then_hangs'] as $behavior) {
+			$this->adversarialScenario($behavior, function (LocalSignerClient $client, string $runId): void {
+				$credential = $this->credentialByRef('synthetic-rsa-leaf');
+				$pdf = $this->makePdf('Local card proof, hung signer ' . $runId);
+				$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+				$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+				$started = microtime(true);
+				try {
+					$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+						$record->operationId,
+						$credential['credentialRef'],
+						$credential['certificateSha256'],
+						$prepared->upstream->payload,
+					));
+					$this->fail('an unresponsive signer must hit the deadline');
+				} catch (SignerTimeoutException $exception) {
+					$this->assertStringContainsString('never be retried', $exception->getMessage());
+				}
+				$elapsed = microtime(true) - $started;
+				$this->assertLessThan(
+					self::OUTER_TIMEOUT_SECONDS,
+					$elapsed,
+					'the bounded exchange must finish well inside the outer timeout',
+				);
+				$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+				try {
+					$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => throw new \AssertionError('resent'));
+					$this->fail('an uncertain operation must never be resent');
+				} catch (\LogicException) {
+					$this->addToAssertionCount(1);
+				}
+				try {
+					$record->completeWith(fn (): string => 'never');
+					$this->fail('an uncertain operation must not be completable');
+				} catch (\LogicException) {
+					$this->addToAssertionCount(1);
+				}
+			}, clientTimeoutSeconds: 1.5);
+		}
+	}
+
+	/**
+	 * The adversarial child IGNORES SIGTERM: bounded cleanup must escalate
+	 * to SIGKILL, stay inside the deadline and leave no child behind.
+	 */
+	public function testSigtermIgnoringChildIsForceKilledBounded(): void {
+		$this->adversarialScenario('ignores_sigterm', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, sigterm ignored ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('a child that ignores SIGTERM must still be bounded');
+			} catch (SignerTimeoutException) {
+				$this->addToAssertionCount(1);
+			}
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 1.5);
+	}
+
+	/**
+	 * A child that never reads stdin with a request large enough to fill
+	 * the pipe: the write path must give up at the deadline (uncertain,
+	 * never resent) and cleanup must reap the child.
+	 */
+	public function testOversizedRequestToNonReadingChildIsBoundedAndUncertain(): void {
+		$this->adversarialScenario('never_reads', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, backpressure ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			// ~900 KiB payload: far above the 64 KiB pipe buffer.
+			$payload = $this->craftPayload(
+				base64_encode(str_repeat('d', 660000)),
+				SigningInputType::Digest,
+				SignatureAlgorithm::RsaPkcs1V15,
+				SignatureEncoding::RsaPkcs1,
+			);
+			$started = microtime(true);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$payload,
+				));
+				$this->fail('an unread request must hit the deadline');
+			} catch (SignerTimeoutException) {
+				$this->addToAssertionCount(1);
+			}
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 1.5, requestLimit: 1048576);
+	}
+
+	/**
+	 * A child that exits before consuming the request: EOF with no output
+	 * is an explicit protocol rejection (nonzero-exit path), classified
+	 * as uncertain because the child ran after submission.
+	 */
+	public function testChildExitingBeforeConsumingRequestIsRejected(): void {
+		$this->adversarialScenario('exits_early', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, early exit ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('a child that exits early must be rejected');
+			} catch (SignerProtocolException $exception) {
+				$this->assertSame(LocalSignerClient::REASON_NO_OUTPUT, $exception->reason);
+			}
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 4.0);
+	}
+
+	/**
+	 * A nonzero exit after otherwise valid output is rejected with the
+	 * specific reason, not swallowed as success.
+	 */
+	public function testNonzeroExitAfterValidOutputIsRejected(): void {
+		$this->adversarialScenario('nonzero_after_output', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, nonzero exit ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('a nonzero exit after valid output must be rejected');
+			} catch (SignerProtocolException $exception) {
+				$this->assertSame(LocalSignerClient::REASON_NONZERO_EXIT, $exception->reason);
+			}
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 4.0);
+	}
+
+	/**
+	 * The stdout contract: a delayed second protocol line after a valid
+	 * response is rejected as trailing content.
+	 */
+	public function testDelayedSecondProtocolLineIsRejected(): void {
+		$this->adversarialScenario('delayed_second_line', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, second line ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('content beyond the single protocol line must be rejected');
+			} catch (SignerProtocolException $exception) {
+				$this->assertSame(LocalSignerClient::REASON_TRAILING_CONTENT, $exception->reason);
+			}
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 4.0);
+	}
+
+	/**
+	 * Output flooding past the cumulative response cap after a valid
+	 * response is rejected with the response-size reason, and leaves no
+	 * child running.
+	 */
+	public function testFloodingOutputAfterResponseIsRejectedBySize(): void {
+		$this->adversarialScenario('floods_after_response', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, flood ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('output beyond the response cap must be rejected');
+			} catch (SignerProtocolException $exception) {
+				$this->assertSame(LocalSignerClient::REASON_RESPONSE_SIZE, $exception->reason);
+			}
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 4.0);
+	}
+
+	/**
+	 * Continuous stdout WITHOUT any newline: the deadline must fire while
+	 * output is arriving, bounding the exchange.
+	 */
+	public function testContinuousStdoutWithoutNewlineHitsDeadline(): void {
+		$this->adversarialScenario('continuous_stdout', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, continuous ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('continuous stdout without a newline must hit the deadline');
+			} catch (SignerProtocolException|SignerTimeoutException $exception) {
+				$this->assertContains(
+					$exception->reason,
+					[LocalSignerClient::REASON_TIMEOUT, LocalSignerClient::REASON_RESPONSE_SIZE, LocalSignerClient::REASON_INVALID_JSON],
+					'continual output must end in a bounded rejection',
+				);
+			}
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 1.5);
+	}
+
+	/**
+	 * Heavy stderr traffic must be drained (bounded tail retained) without
+	 * deadlocking, while the valid one-line response still works.
+	 */
+	public function testHeavyStderrDoesNotDeadlockAndValidResponseWorks(): void {
+		$this->adversarialScenario('heavy_stderr', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, heavy stderr ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
+			$response = $record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+				$record->operationId,
+				$credential['credentialRef'],
+				$credential['certificateSha256'],
+				$prepared->upstream->payload,
+			));
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame('rsa-pkcs1', $response->signatureEncoding, 'the valid one-response path must keep working');
+		}, clientTimeoutSeconds: 8.0);
+	}
+
+	/**
+	 * Run one adversarial child fixture under an INDEPENDENT outer
+	 * timeout (separate process) so a client regression cannot hang the
+	 * suite, and verify afterwards that no child process survived.
+	 *
+	 * The callable receives a client wired to the adversarial script with
+	 * a unique run id; pgrep -f <runId> proves the cleanup.
+	 */
+	private function adversarialScenario(
+		string $behavior,
+		callable $scenario,
+		float $clientTimeoutSeconds = 4.0,
+		int $requestLimit = LocalSignerClient::MAX_REQUEST_BYTES,
+	): void {
+		if (! function_exists('pcntl_fork')) {
+			$this->markTestSkipped('pcntl is unavailable; the independent outer timeout cannot be provided.');
+		}
+		$runId = 'adv-' . uniqid();
+		$adversarialScript = $this->adversarialScript;
+		$pythonBinary = $this->pythonBinary();
+		$buildClient = static fn (): LocalSignerClient => new LocalSignerClient(
+			$pythonBinary,
+			$adversarialScript,
+			null,
+			$clientTimeoutSeconds,
+			$requestLimit,
+			commandOverride: static fn (string $subcommand): array => [
+				$pythonBinary,
+				'-B',
+				$adversarialScript,
+				$behavior,
+				$runId,
+			],
+		);
+
+		$childPid = pcntl_fork();
+		if ($childPid === -1) {
+			$this->markTestSkipped('pcntl_fork failed; the independent outer timeout cannot be provided.');
+		}
+		if ($childPid === 0) {
+			// Child process: run the scenario; exit 0 on success, 1 on any
+			// failure or exception (assertion failures included). The
+			// failure detail is written to a file the parent can report.
+			try {
+				$scenario($buildClient(), $runId);
+				exit(0);
+			} catch (\Throwable $childFailure) {
+				file_put_contents(
+					sys_get_temp_dir() . '/adv-child-' . $runId . '.err',
+					(string)$childFailure,
+				);
+				exit(1);
+			}
+		}
+
+		// Parent: bounded wait independent of the client under test.
+		$outerDeadline = microtime(true) + self::OUTER_TIMEOUT_SECONDS;
+		$childStatus = null;
+		while (microtime(true) < $outerDeadline) {
+			$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
+			if ($waited === $childPid) {
+				break;
+			}
+			usleep(50000);
+		}
+		$stillRunning = pcntl_waitpid($childPid, $childStatus, \WNOHANG) === 0;
+		if ($stillRunning) {
+			posix_kill($childPid, 9); // SIGKILL the test child itself
+			pcntl_waitpid($childPid, $childStatus);
+			$this->fail(sprintf(
+				'the %s scenario exceeded the independent outer timeout of %ds',
+				$behavior,
+				self::OUTER_TIMEOUT_SECONDS,
+			));
+		}
+		$this->assertSame(
+			0,
+			pcntl_wexitstatus($childStatus),
+			"the $behavior scenario failed inside its isolated process"
+			. ': ' . @file_get_contents(sys_get_temp_dir() . '/adv-child-' . $runId . '.err'),
+		);
+
+		// Child cleanup evidence: nothing matching the unique run id remains.
+		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $survivors, $pgrepExit);
+		$this->assertSame(
+			1,
+			$pgrepExit,
+			"child processes survived cleanup for run $runId:\n" . implode("\n", $survivors),
+		);
+	}
+
+	public function testMalformedAndOversizedResponsesAreDistinguishedRejections(): void {
+		$pdf = $this->makePdf('Local card proof, malformed responses');
+		$cases = [
+			// Malformed JSON: the 2 MiB line is one line of garbage.
+			'malformed-response' => LocalSignerClient::REASON_INVALID_JSON,
+			// Oversized output: now truly above the 1 MiB cumulative cap.
+			'oversized-response' => LocalSignerClient::REASON_RESPONSE_SIZE,
+		];
+		foreach ($cases as $scenario => $expectedReason) {
+			$client = $this->client();
 			$credential = $this->credentialByRef('synthetic-rsa-leaf');
 			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
-
-			$record = new ProofOperationRecord('proof-op-hang-' . $scenario, $credential['credentialRef']);
-			$record->markSent();
+			$record = new ProofOperationRecord('proof-op-' . $scenario, $credential['credentialRef']);
 			try {
-				$client->signPreparedOperation(
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
 					$record->operationId,
 					$credential['credentialRef'],
 					$credential['certificateSha256'],
 					$prepared->upstream->payload,
 					['scenario' => $scenario],
-				);
-				$this->fail("scenario $scenario must hit the timeout");
-			} catch (SignerTimeoutException $exception) {
-				$this->assertStringContainsString('never be retried', $exception->getMessage());
-			}
-			$record->markUncertain();
-
-			try {
-				$record->markSent();
-				$this->fail('an uncertain operation must never be retried');
-			} catch (\LogicException $exception) {
-				$this->addToAssertionCount(1);
-			}
-		}
-	}
-
-	public function testMalformedAndOversizedResponsesAreProtocolRejections(): void {
-		$pdf = $this->makePdf('Local card proof, malformed responses');
-		foreach (['malformed-response', 'oversized-response'] as $scenario) {
-			$client = $this->client();
-			$credential = $this->credentialByRef('synthetic-rsa-leaf');
-			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
-			try {
-				$client->signPreparedOperation(
-					'proof-op-' . $scenario,
-					$credential['credentialRef'],
-					$credential['certificateSha256'],
-					$prepared->upstream->payload,
-					['scenario' => $scenario],
-				);
+				));
 				$this->fail("scenario $scenario must be rejected by the protocol");
 			} catch (SignerProtocolException $exception) {
 				$this->assertNotInstanceOf(SignerErrorException::class, $exception);
+				$this->assertSame(
+					$expectedReason,
+					$exception->reason,
+					"scenario $scenario must be rejected for the specific reason",
+				);
 			}
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
 		}
 	}
 
@@ -507,18 +846,22 @@ final class LocalCardSigningProofTest extends TestCase {
 			$client = $this->client();
 			$credential = $this->credentialByRef('synthetic-rsa-leaf');
 			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $scenario, $credential['credentialRef']);
 			try {
-				$client->signPreparedOperation(
-					'proof-op-' . $scenario,
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
 					$credential['credentialRef'],
 					$credential['certificateSha256'],
 					$prepared->upstream->payload,
 					['scenario' => $scenario],
-				);
+				));
 				$this->fail("scenario $scenario must fail correlation");
 			} catch (SignerProtocolException $exception) {
 				$this->assertStringContainsStringIgnoringCase('correlates', $exception->getMessage());
 			}
+			// A correlation failure after submission is potentially
+			// uncertain: the signer may have signed.
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
 		}
 	}
 
@@ -556,17 +899,19 @@ final class LocalCardSigningProofTest extends TestCase {
 		];
 
 		foreach ($cases as $label => $payload) {
+			$record = new ProofOperationRecord('proof-op-unsupported', $rsa['credentialRef']);
 			try {
-				$client->signPreparedOperation(
-					'proof-op-unsupported',
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
 					$rsa['credentialRef'],
 					$rsa['certificateSha256'],
 					$payload,
-				);
+				));
 				$this->fail($label . ' must be rejected');
 			} catch (SignerErrorException $exception) {
 				$this->assertContains($exception->errorCode, ['unsupported-algorithm', 'unsupported-input-type', 'unsupported-encoding']);
 			}
+			$this->assertSame(ProofOperationRecord::STATE_REJECTED, $record->getState(), $label);
 		}
 	}
 
@@ -579,9 +924,10 @@ final class LocalCardSigningProofTest extends TestCase {
 			'empty input' => '',
 		];
 		foreach ($cases as $label => $inputBase64) {
+			$record = new ProofOperationRecord('proof-op-digest', $rsa['credentialRef']);
 			try {
-				$client->signPreparedOperation(
-					'proof-op-digest',
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
 					$rsa['credentialRef'],
 					$rsa['certificateSha256'],
 					$this->craftPayload(
@@ -590,11 +936,12 @@ final class LocalCardSigningProofTest extends TestCase {
 						SignatureAlgorithm::RsaPkcs1V15,
 						SignatureEncoding::RsaPkcs1,
 					),
-				);
+				));
 				$this->fail($label . ' must be rejected');
 			} catch (SignerErrorException $exception) {
 				$this->assertSame('invalid-digest', $exception->errorCode);
 			}
+			$this->assertSame(ProofOperationRecord::STATE_REJECTED, $record->getState(), $label);
 		}
 	}
 
@@ -649,6 +996,7 @@ final class LocalCardSigningProofTest extends TestCase {
 		];
 		foreach ($cases as $label => $payload) {
 			$request = $base + ['payload' => $payload + ['inputType' => 'digest', 'digestAlgorithm' => 'sha256']];
+			$rawOutputLines = [];
 			exec(
 				sprintf(
 					'echo %s | %s -B %s --fixtures %s sign 2>/dev/null',
@@ -666,31 +1014,34 @@ final class LocalCardSigningProofTest extends TestCase {
 				['unsupported-algorithm', 'unexpected-parameter'],
 				$label,
 			);
-			$rawOutputLines = [];
 		}
 	}
 
 	/**
 	 * A signature produced by a DIFFERENT credential (simulated card
-	 * swap) is accepted by the protocol but rejected during completion.
+	 * swap) is accepted by the protocol but rejected during completion:
+	 * the coordinator marks the operation FAILED and the completion
+	 * callback ran exactly once.
 	 */
 	public function testWrongKeySignatureIsRejectedAtCompletion(): void {
 		$pdf = $this->makePdf('Local card proof, wrong key');
 		$lifecycle = $this->runLifecycle('synthetic-rsa-leaf', $pdf, ['scenario' => 'wrong-key']);
 
-		$this->expectException(ExternalSigningException::class);
 		try {
-			$this->service->complete(
-				$lifecycle['prepared'],
-				$lifecycle['signedBySigner']->signature,
-				$pdf,
-				$lifecycle['credential']['certificatePem'],
-			);
-		} finally {
-			// The completed bytes never came back validated: the record
-			// stays in `sent` and is discarded, never retried.
+			$this->completeGuarded($lifecycle, $pdf);
+			$this->fail('a wrong-key signature must be rejected at completion');
+		} catch (ExternalSigningException) {
 			$this->addToAssertionCount(1);
 		}
+		$this->assertSame(ProofOperationRecord::STATE_FAILED, $lifecycle['record']->getState());
+		$this->assertSame(1, $lifecycle['record']->getCompletionInvocations());
+		try {
+			$lifecycle['record']->completeWith(fn (): string => 'never');
+			$this->fail('a failed operation must not be completed again');
+		} catch (\LogicException) {
+			$this->addToAssertionCount(1);
+		}
+		$this->assertSame(1, $lifecycle['record']->getCompletionInvocations(), 'the completion callback must run exactly once ever');
 	}
 
 	/**
@@ -703,10 +1054,11 @@ final class LocalCardSigningProofTest extends TestCase {
 		$client = $this->client();
 		$credential = $this->credentialByRef('synthetic-rsa-leaf');
 		$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+		$record = new ProofOperationRecord('proof-op-double-hash', $credential['credentialRef']);
 
 		$doubleHashed = base64_encode(hash('sha256', $prepared->upstream->payload->input(), true));
-		$response = $client->signPreparedOperation(
-			'proof-op-double-hash',
+		$response = $record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+			$record->operationId,
 			$credential['credentialRef'],
 			$credential['certificateSha256'],
 			$this->craftPayload(
@@ -715,30 +1067,52 @@ final class LocalCardSigningProofTest extends TestCase {
 				SignatureAlgorithm::RsaPkcs1V15,
 				SignatureEncoding::RsaPkcs1,
 			),
-		);
-
-		$this->expectException(ExternalSigningException::class);
-		$this->service->complete($prepared, $response->signature, $pdf, $credential['certificatePem']);
-	}
-
-	public function testDuplicateCompletionAttemptIsRefusedByHarnessRecord(): void {
-		$pdf = $this->makePdf('Local card proof, duplicate completion');
-		$lifecycle = $this->runLifecycle('synthetic-rsa-leaf', $pdf);
-		$completed = $this->service->complete(
-			$lifecycle['prepared'],
-			$lifecycle['signedBySigner']->signature,
-			$pdf,
-			$lifecycle['credential']['certificatePem'],
-		);
-		$this->assertStringStartsWith('%PDF', $completed);
-		$lifecycle['record']->markCompleted();
+		));
 
 		try {
-			$lifecycle['record']->markSent();
-			$this->fail('a completed operation must not be completed or re-sent');
-		} catch (\LogicException $exception) {
+			$record->completeWith(fn (): string => $this->service->complete(
+				$prepared,
+				$response->signature,
+				$pdf,
+				$credential['certificatePem'],
+			));
+			$this->fail('a double-hashed input must be rejected at completion');
+		} catch (ExternalSigningException) {
 			$this->addToAssertionCount(1);
 		}
+		$this->assertSame(ProofOperationRecord::STATE_FAILED, $record->getState());
+	}
+
+	/**
+	 * Duplicate completion: the coordinator refuses the second attempt
+	 * BEFORE invoking the real completion service. The service runs
+	 * exactly once across the whole operation lifetime.
+	 */
+	public function testDuplicateCompletionAttemptIsRefusedBeforeTheService(): void {
+		$pdf = $this->makePdf('Local card proof, duplicate completion');
+		$lifecycle = $this->runLifecycle('synthetic-rsa-leaf', $pdf);
+		$completed = $this->completeGuarded($lifecycle, $pdf);
+		$this->assertStringStartsWith('%PDF', $completed);
+		$this->assertSame(ProofOperationRecord::STATE_COMPLETED, $lifecycle['record']->getState());
+		$this->assertSame(1, $lifecycle['record']->getCompletionInvocations());
+
+		try {
+			$lifecycle['record']->completeWith(function (): string {
+				$this->fail('the completion service must not be invoked for a duplicate attempt');
+
+				return '';
+			});
+			$this->fail('a completed operation must not be completed again');
+		} catch (\LogicException) {
+			$this->addToAssertionCount(1);
+		}
+		try {
+			$lifecycle['record']->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => throw new \AssertionError('resent'));
+			$this->fail('a completed operation must not be re-sent');
+		} catch (\LogicException) {
+			$this->addToAssertionCount(1);
+		}
+		$this->assertSame(1, $lifecycle['record']->getCompletionInvocations());
 	}
 
 	public function testResponseFromAnotherPreparedOperationIsRejectedAtCompletion(): void {
@@ -748,17 +1122,19 @@ final class LocalCardSigningProofTest extends TestCase {
 		$lifecycleA = $this->runLifecycle('synthetic-rsa-leaf', $documentA);
 		$lifecycleB = $this->runLifecycle('synthetic-rsa-leaf', $documentB);
 
-		$this->expectException(ExternalSigningException::class);
 		try {
-			$this->service->complete(
+			$lifecycleB['record']->completeWith(fn (): string => $this->service->complete(
 				$lifecycleB['prepared'],
 				$lifecycleA['signedBySigner']->signature,
 				$documentB,
 				$lifecycleB['credential']['certificatePem'],
-			);
-		} finally {
+			));
+			$this->fail('a signature from another prepared operation must be rejected');
+		} catch (ExternalSigningException) {
 			$this->addToAssertionCount(1);
 		}
+		$this->assertSame(ProofOperationRecord::STATE_FAILED, $lifecycleB['record']->getState());
+		$this->assertSame(ProofOperationRecord::STATE_SENT, $lifecycleA['record']->getState());
 	}
 
 	/**

@@ -14,4 +14,7 @@ namespace LibreSign\Tools\LocalCardSigningProof;
  * must never automatically retry such an operation.
  */
 final class SignerTimeoutException extends SignerProtocolException {
+	public function __construct(string $message) {
+		parent::__construct($message, LocalSignerClient::REASON_TIMEOUT);
+	}
 }

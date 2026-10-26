@@ -36,27 +36,40 @@ test-only operation record.
 Requires PHP 8.3 with a bootstrapped Nextcloud test server whose
 `apps/libresign` checkout holds this branch, and Python 3.9+.
 
+Preferred: the dedicated proof command. It resolves ONE authoritative
+app directory, prepares the Python environment and fixtures for THAT
+checkout, and fails on failures, skips, or zero executed tests.
+
 ```bash
-cd tools/local-card-signing-proof
+# From a Nextcloud server checkout:
+tools/local-card-signing-proof/run-proof.sh /path/to/nextcloud-server
+# Or with a nonstandard apps layout:
+tools/local-card-signing-proof/run-proof.sh /path/to/server apps/libresign
+# Or pointing directly at the app checkout:
+tools/local-card-signing-proof/run-proof.sh /path/to/apps/libresign
+```
+
+Manual steps (step 1 and 2 run from the APP checkout
+`<server>/apps/libresign`; step 3 runs from the SAME app root, which is
+where `vendor/bin/phpunit` and `tests/php/phpunit.xml` live):
+
+```bash
+cd <server>/apps/libresign/tools/local-card-signing-proof
 
 # 1. Python environment (one time)
 python3 -m venv .venv
-.venv/bin/pip install 'cryptography>=42,<46'
+.venv/bin/pip install -r signer/requirements.txt
 
 # 2. Synthetic fixtures (explicit init step; keys stay in fixtures/)
 .venv/bin/python signer/local_signer.py init
 
-# 3. The proof (RSA + EC lifecycles, cross-process completion,
-#    preservation of prior signatures, and every failure scenario)
-#    Run from the Nextcloud server checkout that contains this app:
+# 3. The proof — run from the APP root, not the server root:
+cd <server>/apps/libresign
+LOCAL_CARD_SIGNER_PYTHON=tools/local-card-signing-proof/.venv/bin/python \
 CI=1 php -d memory_limit=1G vendor/bin/phpunit --do-not-cache-result \
   -c tests/php/phpunit.xml --testsuite integration \
   --filter LocalCardSigningProofTest
 ```
-
-Or run `./run-proof.sh` from this directory with the server checkout
-root as argument. Skips: the test reports a skip when the Python
-environment is absent.
 
 ## Process protocol
 
@@ -158,17 +171,36 @@ The proof drives LibreSign's real `ExternalPdfSigningService`:
 
 ## Failure behavior and retry limitations
 
-- Protocol failures (reader missing, cancellation, PIN rejection, card
-  blocked, malformed/oversized IO, correlation mismatch, unsupported
-  combination, invalid digest): rejected before any signature exists.
-  The prepared operation is simply discarded.
-- Cryptographic failures (wrong key, double-hashed input, signature from
-  another operation): rejected during completion by the real validator.
-- Timeout or process death: outcome UNKNOWN. The harness operation
-  record marks the operation `uncertain` and REFUSES to resend it. No
-  automatic retry of a potentially completed signing operation, ever.
-- Duplicate completion: refused by the test-harness operation record
-  (`ProofOperationRecord`). No production persistence is added.
+The harness coordinator (`ProofOperationRecord`, test-only) classifies
+outcomes AUTOMATICALLY and conservatively:
+
+- Explicit simulated PRE-SIGN rejection (reader missing, cancellation,
+  PIN rejection, card blocked, invalid request, unsupported combination,
+  invalid digest, credential or fingerprint mismatch): the signer's
+  documented validation runs entirely BEFORE key access, so these
+  failures prove no signature exists. The operation closes as
+  `rejected`.
+- Anything else observed AFTER submission — unusable or malformed
+  response, oversized output, trailing content, crash, nonzero exit,
+  timeout or correlation failure — is a POTENTIALLY UNCERTAIN outcome:
+  the signer may have used the key. The operation closes as `uncertain`
+  and is NEVER resent. Protocol diagnostics in those errors are useful
+  but are not proof that signing did not occur.
+- Cryptographic validation failure (wrong key, double-hashed input,
+  signature from another operation): rejected during completion by the
+  real validator. The operation closes as `failed`; its bytes are never
+  returned or published.
+- Duplicate completion: refused by the coordinator BEFORE the completion
+  service is invoked. The completion callback runs exactly once per
+  operation. No production persistence is added.
+
+`run-proof.sh` resolves ONE authoritative app directory (a Nextcloud
+server root with `apps/libresign`, or an explicit app path), verifies
+the checkout contains the proof and the real service, prepares the
+Python environment and fixtures for THAT checkout, exports the exact
+Python binary via `LOCAL_CARD_SIGNER_PYTHON`, and FAILS on PHPUnit
+errors, skipped tests, or a run with zero executed tests (JUnit report,
+never parsed console output).
 
 ## Future SDK mapping (Autenticação.gov middleware)
 

@@ -14,4 +14,10 @@ namespace LibreSign\Tools\LocalCardSigningProof;
  * before producing a signature, or the harness rejected its response.
  */
 class SignerProtocolException extends \RuntimeException {
+	public function __construct(
+		string $message,
+		public readonly string $reason = 'protocol',
+	) {
+		parent::__construct(sprintf('[%s] %s', $reason, $message));
+	}
 }
