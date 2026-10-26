@@ -74,16 +74,19 @@ CI=1 php -d memory_limit=1G vendor/bin/phpunit --do-not-cache-result \
 ## Process protocol
 
 One JSON request on stdin, one JSON response line on stdout, diagnostics
-on stderr. Limits: 64 KiB per request, 1 MiB per response, hard process
-timeout (default 10 s; the harness kills the child and classifies the
-outcome as UNKNOWN — never automatically retried).
-
-Request (only these fields are accepted; unknown top-level keys,
-unknown payload keys and a null `simulation` are rejected). Timeouts
-cover the WHOLE process lifetime, not just the first output line: a
-child that answers and then refuses to exit is still classified as
-UNKNOWN. Diagnostics: the signer writes stderr; the harness captures it
-and includes its tail in timeout and crash exceptions.
+on stderr. Limits: 64 KiB per request, 1 MiB cumulative response, hard
+process deadline (default 10 s, `hrtime`-monotonic, covering the WHOLE
+child lifetime — an answer-then-hang child is still an uncertain
+outcome). All deadline arithmetic is monotonic; the termination grace
+period (2 s) and kill confirmation period (2 s) are separate bounded
+periods. Termination is CONFIRMED (SIGTERM → grace poll → SIGKILL →
+exit observed) and requires `posix_kill`; without it the client refuses
+to launch a child at all. Rejections carry stable reasons
+(`REASON_*` on `SignerProtocolException`). Request validation is strict:
+unknown top-level keys, unknown payload keys and a null `simulation`
+are rejected. Diagnostics: the signer writes stderr; the harness
+retains only a bounded 8 KiB tail and includes it in timeout and crash
+exceptions.
 
 ```json
 {

@@ -30,9 +30,13 @@ elif [ -d "$CANDIDATE" ]; then
 	APP_DIR="$CANDIDATE/$SUBDIR"
 fi
 
-# Authoritative selection checks: the app must contain the proof AND the
-# real external-signing service it drives.
+# Normalize to an ABSOLUTE PHYSICAL path BEFORE anything else is derived
+# from it (tools dir, python, fixtures, exported env), and before the
+# script changes directory. Relative arguments and paths with spaces are
+# safe from here on; nothing depends on the caller's working directory.
 [ -n "$APP_DIR" ] || fail "could not locate a LibreSign checkout at '$CANDIDATE'"
+APP_DIR="$(cd "$APP_DIR" 2>/dev/null && pwd -P)" \
+	|| fail "cannot resolve the app directory '$APP_DIR' to a physical path"
 [ -d "$APP_DIR" ] || fail "no app directory at $APP_DIR"
 [ -f "$APP_DIR/tools/local-card-signing-proof/signer/local_signer.py" ] \
 	|| fail "$APP_DIR does not contain the proof (missing tools/local-card-signing-proof/signer/local_signer.py); wrong checkout?"
@@ -60,11 +64,15 @@ export LOCAL_CARD_SIGNER_PYTHON="$TOOL_DIR/.venv/bin/python"
 #    cases are detected reliably (console colors are never parsed).
 REPORT="$(mktemp -t junit-8356-XXXXXX).xml"
 trap 'rm -f "$REPORT"' EXIT
+# Exported for test doubles (a fake phpunit can write to it); harmless
+# for the real PHPUnit invocation, which receives the path explicitly.
+export JUNIT_REPORT_FILE="$REPORT"
 
 cd "$APP_DIR"
 set +e
 CI=1 php -d memory_limit=1G vendor/bin/phpunit \
 	--do-not-cache-result \
+	--no-coverage \
 	-c tests/php/phpunit.xml \
 	--testsuite integration \
 	--filter LocalCardSigningProofTest \
@@ -72,11 +80,13 @@ CI=1 php -d memory_limit=1G vendor/bin/phpunit \
 PHPUNIT_EXIT=$?
 set -e
 
-# PHPUnit exits 1 for warnings too (e.g. "no code coverage driver" in
-# local environments). The JUnit report below is the authoritative gate:
-# it fails the run on any failure, error, skip or zero executed tests.
-# Anything above exit 1 is a hard phpunit error and fails immediately.
-[ "$PHPUNIT_EXIT" -le 1 ] || fail "phpunit failed with exit code $PHPUNIT_EXIT"
+# A dedicated proof run requires a SUCCESSFUL PHPUnit exit (0). Coverage
+# collection is explicitly disabled (--no-coverage) so the local "no code
+# coverage driver" warning cannot turn a green run into a nonzero exit;
+# unrelated warnings and risky-test failures are NOT suppressed. The
+# JUnit report below remains the gate for failures, errors, skipped
+# tests and zero executed tests.
+[ "$PHPUNIT_EXIT" -eq 0 ] || fail "phpunit failed with exit code $PHPUNIT_EXIT"
 
 # The report is written locally by our own PHPUnit run, not untrusted
 # input; the stdlib parser never expands external entities and this file

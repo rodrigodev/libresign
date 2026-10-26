@@ -52,6 +52,27 @@ def echo_ok():
     sys.stdout.flush()
 
 
+def _fill_pipes_then_valid():
+    """Fill the STDERR pipe before reading the request, then complete.
+
+    Exercises true concurrent I/O: the client must drain stderr while it
+    is still transmitting a large request. 1 MiB of stderr noise is far
+    above the 64 KiB pipe buffers. stdout stays reserved for the single
+    protocol line, which the strict one-line contract requires.
+    """
+    noise = "e" * (1024 * 1024)
+    sys.stderr.write(noise)
+    sys.stderr.flush()
+    echo_ok()
+
+
+def _continuous_stderr():
+    while True:
+        sys.stderr.write("e" * 4096)
+        sys.stderr.flush()
+        time.sleep(0.02)
+
+
 def _continuous():
     while True:
         sys.stdout.write("y" * 4096)
@@ -97,6 +118,11 @@ HANDLERS = {
     "floods_after_response": _flood_after_response,
     # Continuous stdout WITHOUT any newline, forever.
     "continuous_stdout": _continuous,
+    # Continuous stderr forever (deadline checks inside the drain path).
+    "continuous_stderr": _continuous_stderr,
+    # Fills both pipe buffers before reading a large request, then
+    # completes validly — concurrent-I/O regression fixture.
+    "fills_pipes_then_valid": _fill_pipes_then_valid,
     # Heavy stderr traffic around a valid correlated response.
     "heavy_stderr": _heavy_stderr,
     # Valid correlated response and a clean exit (control case).

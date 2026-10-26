@@ -14,30 +14,41 @@ use SignerPHP\PdfSigner\Application\DTO\ExternalSigningPayload;
  * Harness-side client for the local synthetic-card signer process
  * (issue #8356 local-signing proof — TEST ONLY).
  *
- * Runs the Python signer as a separate operating-system process, speaks
- * the bounded JSON request/response protocol over stdin/stdout and
- * enforces, on the harness side:
+ * Runs the Python signer as a separate operating-system process and
+ * speaks the bounded JSON request/response protocol over stdin/stdout.
  *
- * - a monotonic deadline that starts before process launch and governs
+ * Time: ALL deadline arithmetic uses `hrtime(true)` (monotonic
+ * nanoseconds). Two independently documented bounded periods exist:
+ *
+ * - operation timeout (`$timeoutSeconds`): covers process launch,
  *   request transmission, response collection and child shutdown. The
- *   launch call itself is not interruptible by PHP; the deadline is
- *   enforced from the first point PHP regains control;
- * - nonblocking stdin/stdout/stderr with partial-write handling and
- *   concurrent draining (no pipe-buffer deadlocks);
- * - request-size and cumulative response-size limits;
- * - a strict stdout contract: exactly one JSON protocol line, no
- *   trailing content, including content emitted after a delay;
- * - bounded stderr retention (diagnostic tail only) while draining;
- * - explicit handling of EOF, early child exit and broken pipes;
- * - bounded cleanup: stdin closed, SIGTERM, bounded grace period while
- *   draining, escalation to SIGKILL when the platform supports it, then
- *   reap. proc_close() is only called once the child is confirmed
- *   exited or SIGKILLed, so it cannot wait indefinitely. Cleanup also
- *   runs after exceptions.
+ *   launch call itself is not interruptible from PHP; the deadline is
+ *   enforced from the first point PHP regains control.
+ * - termination grace (`TERMINATION_GRACE_SECONDS`): a SECOND bounded
+ *   period, used only during cleanup, between SIGTERM and SIGKILL
+ *   escalation, followed by `KILL_CONFIRM_SECONDS` to confirm exit.
  *
- * Limitation: cleanup guarantees cover the direct child only. If a child
- * spawns descendants that outlive it, this client does not track or kill
- * them. The proof's fixtures never spawn descendants.
+ * I/O: ONE event loop interleaves request writes (stdin writable) and
+ * output drains (stdout/stderr readable). Per-stream work is capped per
+ * iteration so a continuous producer cannot starve the deadline checks
+ * or the other streams. `stream_select()` errors are retried with a
+ * short bounded sleep until the deadline — never a busy loop.
+ *
+ * The stdout contract is strict: exactly one JSON protocol line, no
+ * trailing content (including delayed output), a cumulative size cap on
+ * stdout and a bounded retained tail on stderr.
+ *
+ * Termination: required capabilities (`posix_kill`) are checked BEFORE
+ * any child is launched. Cleanup is bounded and CONFIRMED: SIGTERM, a
+ * bounded grace period polling for exit, SIGKILL escalation, then a
+ * final bounded confirmation poll. `proc_close()` runs only after exit
+ * is OBSERVED; the FIRST captured terminal status is preserved and not
+ * replaced by `proc_close()`'s return. If termination cannot be
+ * confirmed, this client THROWS (`REASON_TERMINATION_UNCONFIRMED`)
+ * instead of blocking or claiming guaranteed cleanup; the child may
+ * leak in that case and the operation stays uncertain. Limitation:
+ * cleanup covers the DIRECT child only; descendants are not tracked.
+ * The proof fixtures never spawn any.
  *
  * Correlation of the operation identifier and credential reference is
  * correlation data only — NOT authentication, NOT idempotency.
@@ -52,10 +63,14 @@ final class LocalSignerClient {
 	public const MAX_STDERR_TAIL_BYTES = 8192;
 	/** Bounded grace period between SIGTERM and SIGKILL escalation. */
 	public const TERMINATION_GRACE_SECONDS = 2.0;
+	/** Bounded final confirmation period after SIGKILL. */
+	public const KILL_CONFIRM_SECONDS = 2.0;
 
 	/** Stable rejection reasons for test discrimination. */
 	public const REASON_REQUEST_SIZE = 'request-size';
 	public const REASON_SPAWN = 'spawn';
+	public const REASON_TERMINATION_UNSUPPORTED = 'termination-unsupported';
+	public const REASON_TERMINATION_UNCONFIRMED = 'termination-unconfirmed';
 	public const REASON_TIMEOUT = 'timeout';
 	public const REASON_RESPONSE_SIZE = 'response-size';
 	public const REASON_TRAILING_CONTENT = 'trailing-content';
@@ -63,6 +78,13 @@ final class LocalSignerClient {
 	public const REASON_NONZERO_EXIT = 'nonzero-exit';
 	public const REASON_NO_OUTPUT = 'no-output';
 	public const REASON_PROTOCOL = 'protocol';
+
+	/** Nanoseconds per second, for hrtime(true) arithmetic. */
+	private const NANOSECONDS = 1_000_000_000;
+	/** Max bytes read per stream per loop iteration (starvation guard). */
+	private const MAX_READ_PER_STREAM_PER_ITERATION = 262144;
+	/** Max bytes written to stdin per loop iteration. */
+	private const MAX_WRITE_PER_ITERATION = 262144;
 
 	public function __construct(
 		private string $pythonBinary,
@@ -73,6 +95,8 @@ final class LocalSignerClient {
 		private int $requestLimit = self::MAX_REQUEST_BYTES,
 		/** TEST-ONLY: replaces the whole argv for adversarial child fixtures. */
 		private ?\Closure $commandOverride = null,
+		/** TEST-ONLY: force the termination-capability probe (null = auto-detect). */
+		private ?bool $terminationSupport = null,
 	) {
 	}
 
@@ -234,6 +258,15 @@ final class LocalSignerClient {
 	}
 
 	/**
+	 * Termination requires a reliable SIGKILL. The capability is verified
+	 * BEFORE any child is launched, so a missing facility is a clear
+	 * pre-spawn rejection instead of an unbounded cleanup.
+	 */
+	private function terminationSupported(): bool {
+		return $this->terminationSupport ?? function_exists('posix_kill');
+	}
+
+	/**
 	 * Run one bounded protocol exchange.
 	 *
 	 * @return array<string, mixed>
@@ -248,10 +281,16 @@ final class LocalSignerClient {
 			), self::REASON_REQUEST_SIZE);
 		}
 
-		// Monotonic deadline. It starts BEFORE launch and covers request
-		// transmission, response collection and child shutdown. proc_open
-		// itself is not interruptible from PHP; no claim is made otherwise.
-		$deadline = microtime(true) + $this->timeoutSeconds;
+		if (! $this->terminationSupported()) {
+			throw new SignerProtocolException(
+				'this platform cannot provide CONFIRMED child termination'
+				. ' (posix_kill unavailable); the proof refuses to launch a signer process',
+				self::REASON_TERMINATION_UNSUPPORTED,
+			);
+		}
+
+		// Monotonic deadline in nanoseconds, starting BEFORE launch.
+		$deadlineNs = hrtime(true) + (int)round($this->timeoutSeconds * self::NANOSECONDS);
 
 		if ($this->commandOverride !== null) {
 			$command = ($this->commandOverride)($subcommand);
@@ -278,29 +317,32 @@ final class LocalSignerClient {
 		$raw = '';
 		$stderrTail = '';
 		$stdinOpen = true;
+		$stdinBroken = false;
+		$stdinOffset = 0;
+		$requestLength = strlen($encoded);
+		$stdoutOpen = true;
+		$stderrOpen = true;
+		$exitCode = null;
+		$timedOut = false;
 
 		try {
-			// Write the request fully before closing stdin. Partial writes
-			// are retried against the deadline; a broken pipe (child exited
-			// before consuming the request) is tolerated here and the
-			// resulting EOF/exit is classified below.
-			$this->writeAll($stdin, $encoded, $deadline);
-			fclose($stdin);
-			$stdinOpen = false;
-
-			// Drain stdout AND stderr concurrently until stdout reaches EOF
-			// and the child exits. This avoids pipe-buffer deadlocks even
-			// when a child floods stderr or keeps writing after responding.
-			$stdoutOpen = true;
-			$stderrOpen = true;
-			$exitCode = null;
-			$timedOut = false;
+			// ONE event loop: write request chunks when stdin is writable,
+			// drain stdout/stderr while the request is still transmitting.
+			// Per-stream work is capped per iteration; the monotonic
+			// deadline is checked on EVERY iteration.
 			while (true) {
 				$status = proc_get_status($process);
 				if ($status['running'] === false && $exitCode === null) {
 					// The real exit code is reported only on the first
 					// proc_get_status call after exit; capture it once.
 					$exitCode = $status['exitcode'];
+				}
+
+				// Settle check FIRST: the empty-streams poll below must
+				// never skip deadline or termination evaluation.
+				$stdinSettled = ! $stdinOpen || $stdinBroken;
+				if ($stdinSettled && ! $stdoutOpen && $exitCode !== null) {
+					break;
 				}
 
 				$read = [];
@@ -310,73 +352,118 @@ final class LocalSignerClient {
 				if ($stderrOpen) {
 					$read[] = $stderrPipe;
 				}
-				if ($read !== []) {
-					$remainingUs = (int)max(0, ($deadline - microtime(true)) * 1e6);
-					$except = null;
-					$write = null;
-					$selected = @stream_select($read, $write, $except, 0, min($remainingUs, 200000));
-					if ($selected === false) {
-						// Interrupted (e.g. by a signal): retry until deadline.
-					} elseif ($selected > 0) {
-						foreach ($read as $stream) {
-							while (true) {
-								$chunk = @fread($stream, 65536);
-								if ($chunk === false || $chunk === '') {
-									break;
-								}
-								if ($stream === $stdout) {
-									$raw .= $chunk;
-									if (strlen($raw) > self::MAX_RESPONSE_BYTES) {
-										throw new SignerProtocolException(sprintf(
-											'signer response exceeds %d cumulative bytes',
-											self::MAX_RESPONSE_BYTES,
-										), self::REASON_RESPONSE_SIZE);
-									}
-								} else {
-									// Bounded diagnostic tail: keep draining,
-									// retain only the documented tail length.
-									$stderrTail = substr($stderrTail . $chunk, -self::MAX_STDERR_TAIL_BYTES);
-								}
-							}
-							if (feof($stream)) {
-								if ($stream === $stdout) {
-									$stdoutOpen = false;
-								} else {
-									$stderrOpen = false;
-								}
-							}
+				$write = [];
+				if ($stdinOpen && ! $stdinBroken) {
+					$write[] = $stdin;
+				}
+
+				if ($read === [] && $write === []) {
+					// All streams settled but the child's exit has not been
+					// observed yet: poll the status on a bounded sleep. The
+					// monotonic deadline still applies here.
+					if (hrtime(true) >= $deadlineNs) {
+						$timedOut = true;
+						break;
+					}
+					usleep(10000);
+					continue;
+				}
+
+				$remainingNs = $deadlineNs - hrtime(true);
+				if ($remainingNs <= 0) {
+					$timedOut = true;
+					break;
+				}
+				$selectUs = (int)min($remainingNs / 1000, 200000);
+				$except = null;
+				$selected = @stream_select($read, $write, $except, 0, $selectUs);
+				if ($selected === false) {
+					// Select error (e.g. interrupted by a signal): a short
+					// bounded sleep and retry. The deadline check above
+					// still applies on every iteration — never a busy loop.
+					usleep(10000);
+					continue;
+				}
+
+				// WRITE side: one bounded chunk per iteration. A broken
+				// pipe means the child exited before consuming the
+				// request; stop writing and let the drain/classification
+				// below report the outcome.
+				if ($write !== []) {
+					$chunk = substr($encoded, $stdinOffset, self::MAX_WRITE_PER_ITERATION);
+					$written = @fwrite($stdin, $chunk);
+					if ($written === false || ($written === 0 && $chunk !== '')) {
+						$stdinBroken = true;
+						fclose($stdin);
+						$stdinOpen = false;
+					} else {
+						$stdinOffset += $written;
+						if ($stdinOffset >= $requestLength) {
+							fclose($stdin);
+							$stdinOpen = false;
 						}
 					}
 				}
 
-				if (! $stdoutOpen && $exitCode !== null) {
-					// stdout at EOF and child exited: drain any buffered
-					// remainder of stderr, then settle.
-					if ($stderrOpen) {
-						while (true) {
-							$chunk = @fread($stderrPipe, 65536);
-							if ($chunk === false || $chunk === '') {
-								break;
+				// READ side: bounded work per stream per iteration.
+				foreach ($read as $stream) {
+					$bytesThisStream = 0;
+					while ($bytesThisStream < self::MAX_READ_PER_STREAM_PER_ITERATION) {
+						$chunk = @fread($stream, 65536);
+						if ($chunk === false || $chunk === '') {
+							break;
+						}
+						$bytesThisStream += strlen($chunk);
+						if ($stream === $stdout) {
+							$raw .= $chunk;
+							if (strlen($raw) > self::MAX_RESPONSE_BYTES) {
+								throw new SignerProtocolException(sprintf(
+									'signer response exceeds %d cumulative bytes',
+									self::MAX_RESPONSE_BYTES,
+								), self::REASON_RESPONSE_SIZE);
 							}
+						} else {
+							// Bounded diagnostic tail: keep draining,
+							// retain only the documented tail length.
 							$stderrTail = substr($stderrTail . $chunk, -self::MAX_STDERR_TAIL_BYTES);
 						}
 					}
-					break;
+					if (feof($stream)) {
+						if ($stream === $stdout) {
+							$stdoutOpen = false;
+						} else {
+							$stderrOpen = false;
+						}
+					}
 				}
-				if (microtime(true) >= $deadline) {
-					$timedOut = true;
+
+				$stdinSettled = ! $stdinOpen || $stdinBroken;
+				if ($stdinSettled && ! $stdoutOpen && $exitCode !== null) {
+					// Drain any buffered stderr remainder (bounded), then
+					// settle: stdout reached EOF and the child exited.
+					while ($stderrOpen) {
+						$chunk = @fread($stderrPipe, 65536);
+						if ($chunk === false || $chunk === '') {
+							break;
+						}
+						$stderrTail = substr($stderrTail . $chunk, -self::MAX_STDERR_TAIL_BYTES);
+						if (feof($stderrPipe)) {
+							break;
+						}
+					}
 					break;
 				}
 			}
 
 			if ($stdinOpen) {
 				fclose($stdin);
+				$stdinOpen = false;
 			}
 			fclose($stdout);
 			fclose($stderrPipe);
 
 			if ($timedOut) {
-				$this->terminateBounded($process);
+				$this->terminateConfirmed($process);
 				throw new SignerTimeoutException(sprintf(
 					'local signer exceeded the %.1fs deadline; its outcome is UNKNOWN and the'
 					. ' operation must never be retried automatically. stderr tail: %s',
@@ -385,8 +472,11 @@ final class LocalSignerClient {
 				));
 			}
 
-			// Reap a confirmed-exited child: proc_close cannot block here.
-			$exitCode = proc_close($process);
+			// Reap a child whose exit was OBSERVED above. The FIRST
+			// captured terminal exit code is preserved: proc_close()'s own
+			// return value is unreliable once proc_get_status has consumed
+			// the status, and is deliberately not used.
+			proc_close($process);
 
 			if (trim($raw) === '') {
 				throw new SignerProtocolException(sprintf(
@@ -432,83 +522,76 @@ final class LocalSignerClient {
 			return $decoded;
 		} catch (\Throwable $exception) {
 			// Cleanup must also happen after exceptions.
-			if ($stdinOpen) {
+			if ($stdinOpen && is_resource($stdin)) {
 				fclose($stdin);
+				$stdinOpen = false;
 			}
-			if (is_resource($stdout)) {
+			if (isset($stdout) && is_resource($stdout)) {
 				fclose($stdout);
 			}
-			if (is_resource($stderrPipe)) {
+			if (isset($stderrPipe) && is_resource($stderrPipe)) {
 				fclose($stderrPipe);
 			}
 			if (is_resource($process)) {
-				$this->terminateBounded($process);
+				$this->terminateConfirmed($process);
 			}
 			throw $exception;
 		}
 	}
 
 	/**
-	 * Write the whole buffer to a nonblocking pipe, handling partial
-	 * writes, until the deadline. A broken pipe (the child exited before
-	 * reading everything) returns silently; the child's exit is classified
-	 * by the drain loop.
+	 * Bounded, CONFIRMED termination of a still-running child: SIGTERM, a
+	 * bounded grace period polling for exit, SIGKILL escalation, then a
+	 * final bounded confirmation poll. Signal-call results are checked.
+	 * proc_close() runs only after exit is OBSERVED; if exit cannot be
+	 * confirmed within the bounded periods this method THROWS — it never
+	 * falls back to an unbounded wait and never presents cleanup as
+	 * guaranteed. Requires posix_kill (checked before launch).
 	 */
-	private function writeAll($stream, string $buffer, float $deadline): void {
-		$offset = 0;
-		$length = strlen($buffer);
-		while ($offset < $length) {
-			$written = @fwrite($stream, substr($buffer, $offset));
-			if ($written === false || $written === 0) {
-				if (microtime(true) >= $deadline) {
-					throw new SignerTimeoutException(sprintf(
-						'could not transmit the request within the %.1fs deadline (pipe backpressure);'
-						. ' its outcome is UNKNOWN and the operation must never be retried automatically',
-						$this->timeoutSeconds,
-					));
-				}
-				usleep(10000);
-				continue;
-			}
-			$offset += $written;
-		}
-	}
-
-	/**
-	 * Bounded termination: request termination, allow a short bounded
-	 * grace period, escalate to SIGKILL when the platform supports it,
-	 * then reap. Never calls proc_close() while the child may still run
-	 * unbounded.
-	 */
-	private function terminateBounded($process): void {
+	private function terminateConfirmed($process): void {
 		$status = proc_get_status($process);
 		if ($status['running'] === false) {
 			proc_close($process);
 
 			return;
 		}
-		proc_terminate($process);
-		$graceEnd = microtime(true) + self::TERMINATION_GRACE_SECONDS;
-		do {
-			usleep(50000);
-			$status = proc_get_status($process);
-		} while ($status['running'] && microtime(true) < $graceEnd);
+		$pid = $status['pid'];
+		$graceDeadlineNs = hrtime(true) + (int)round(self::TERMINATION_GRACE_SECONDS * self::NANOSECONDS);
+		$sigtermSent = @posix_kill($pid, 15); // SIGTERM
+		if ($sigtermSent) {
+			do {
+				usleep(20000);
+				$status = proc_get_status($process);
+			} while ($status['running'] && hrtime(true) < $graceDeadlineNs);
+		}
+
 		if ($status['running']) {
-			if (function_exists('posix_kill')) {
-				posix_kill($status['pid'], 9); // SIGKILL — unconditional
-				usleep(100000);
-			} else {
-				// Platform without SIGKILL support: one further bounded
-				// wait, then give up on liveness confirmation. proc_close
-				// may still block in that unsupported environment; the
-				// proof targets macOS/Linux where posix_kill exists.
-				$hardEnd = microtime(true) + self::TERMINATION_GRACE_SECONDS;
+			$killDeadlineNs = hrtime(true) + (int)round(self::KILL_CONFIRM_SECONDS * self::NANOSECONDS);
+			$sigkillSent = @posix_kill($pid, 9); // SIGKILL
+			if ($sigkillSent) {
 				do {
-					usleep(50000);
+					usleep(20000);
 					$status = proc_get_status($process);
-				} while ($status['running'] && microtime(true) < $hardEnd);
+				} while ($status['running'] && hrtime(true) < $killDeadlineNs);
 			}
 		}
+
+		if ($status['running']) {
+			// Defined behavior: give up LOUDLY instead of blocking or
+			// presenting cleanup as guaranteed. The child may leak; the
+			// operation remains uncertain either way. The reap is still
+			// attempted because PHP requires it to free the handle; the
+			// thrown error documents that exit was NOT confirmed.
+			proc_close($process);
+			throw new SignerProtocolException(
+				'could not CONFIRM the termination of the local signer child within the bounded'
+				. ' grace and kill periods; the child may still be running. This is a hard'
+				. ' environment failure, not a bounded cleanup guarantee.',
+				self::REASON_TERMINATION_UNCONFIRMED,
+			);
+		}
+
+		// Exit observed: safe to reap.
 		proc_close($process);
 	}
 

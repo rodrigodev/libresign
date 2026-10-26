@@ -729,6 +729,50 @@ final class LocalCardSigningProofTest extends TestCase {
 		float $clientTimeoutSeconds = 4.0,
 		int $requestLimit = LocalSignerClient::MAX_REQUEST_BYTES,
 	): void {
+		$result = $this->runIsolatedScenario($behavior, $scenario, $clientTimeoutSeconds, $requestLimit);
+		$this->assertSame(
+			0,
+			$result['exitcode'],
+			"the $behavior scenario failed inside its isolated process: " . $result['detail'],
+		);
+		$this->assertFalse(
+			$result['signaled'],
+			"the $behavior scenario was killed by signal " . ($result['signal'] ?? '?'),
+		);
+		$this->assertFalse(
+			$result['timedOut'],
+			"the $behavior scenario exceeded the independent outer timeout",
+		);
+		$this->assertFalse(
+			$result['survivors'],
+			"child processes survived cleanup for run {$result['runId']}",
+		);
+	}
+
+	/**
+	 * Run one scenario closure in a FORKED process under an independent
+	 * monotonic outer watchdog, and return its terminal outcome WITHOUT
+	 * asserting — so both the adversarial tests and the watchdog
+	 * meta-regression tests can use the same machinery.
+	 *
+	 * The terminal result of pcntl_waitpid() is captured exactly once;
+	 * waitpid is never called again after a successful reap. Running,
+	 * exited, signaled and wait-error results are distinguished, and
+	 * pcntl_wexitstatus() is used only after pcntl_wifexited().
+	 *
+	 * Cleanup runs in `finally`: the isolated test child AND any signer
+	 * process it launched (matched by the narrowly scoped unique run id)
+	 * are killed, and temporary diagnostic files are removed after the
+	 * parent has read them.
+	 *
+	 * @return array{exitcode: int, signaled: bool, signal: ?int, timedOut: bool, survivors: bool, runId: string, detail: string, waitError: bool}
+	 */
+	private function runIsolatedScenario(
+		string $behavior,
+		callable $scenario,
+		float $clientTimeoutSeconds = 4.0,
+		int $requestLimit = LocalSignerClient::MAX_REQUEST_BYTES,
+	): array {
 		if (! function_exists('pcntl_fork')) {
 			$this->markTestSkipped('pcntl is unavailable; the independent outer timeout cannot be provided.');
 		}
@@ -750,6 +794,7 @@ final class LocalCardSigningProofTest extends TestCase {
 			],
 		);
 
+		$diagnosticFile = sys_get_temp_dir() . '/adv-child-' . $runId . '.err';
 		$childPid = pcntl_fork();
 		if ($childPid === -1) {
 			$this->markTestSkipped('pcntl_fork failed; the independent outer timeout cannot be provided.');
@@ -757,53 +802,280 @@ final class LocalCardSigningProofTest extends TestCase {
 		if ($childPid === 0) {
 			// Child process: run the scenario; exit 0 on success, 1 on any
 			// failure or exception (assertion failures included). The
-			// failure detail is written to a file the parent can report.
+			// failure detail goes to a file the parent can report.
 			try {
 				$scenario($buildClient(), $runId);
 				exit(0);
 			} catch (\Throwable $childFailure) {
-				file_put_contents(
-					sys_get_temp_dir() . '/adv-child-' . $runId . '.err',
-					(string)$childFailure,
-				);
+				file_put_contents($diagnosticFile, (string)$childFailure);
 				exit(1);
 			}
 		}
 
-		// Parent: bounded wait independent of the client under test.
-		$outerDeadline = microtime(true) + self::OUTER_TIMEOUT_SECONDS;
-		$childStatus = null;
-		while (microtime(true) < $outerDeadline) {
-			$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
-			if ($waited === $childPid) {
-				break;
+		// Parent: bounded wait on a monotonic clock, independent of the
+		// client under test. The waitpid result is consumed EXACTLY ONCE.
+		$outerDeadlineNs = hrtime(true) + self::OUTER_TIMEOUT_SECONDS * 1_000_000_000;
+		$childStatus = 0;
+		$reaped = false;
+		$waitError = false;
+		$watchdogFired = false;
+		try {
+			while (hrtime(true) < $outerDeadlineNs) {
+				$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
+				if ($waited === $childPid) {
+					$reaped = true;
+					break;
+				}
+				if ($waited === -1) {
+					$waitError = true;
+					break;
+				}
+				usleep(50000);
 			}
-			usleep(50000);
+			if (! $reaped && ! $waitError) {
+				// Outer watchdog fired: kill the isolated test child, then
+				// any signer process it launched, and reap it.
+				$watchdogFired = true;
+				$this->killRunProcesses($runId);
+				posix_kill($childPid, 9); // SIGKILL
+				$waited = pcntl_waitpid($childPid, $childStatus);
+				$reaped = $waited === $childPid;
+			}
+		} finally {
+			// Runs when the scenario failed, the test child crashed, or
+			// the watchdog fired: kill any signer survivor by run id.
+			$this->killRunProcesses($runId);
 		}
-		$stillRunning = pcntl_waitpid($childPid, $childStatus, \WNOHANG) === 0;
-		if ($stillRunning) {
-			posix_kill($childPid, 9); // SIGKILL the test child itself
-			pcntl_waitpid($childPid, $childStatus);
-			$this->fail(sprintf(
-				'the %s scenario exceeded the independent outer timeout of %ds',
-				$behavior,
-				self::OUTER_TIMEOUT_SECONDS,
-			));
-		}
-		$this->assertSame(
-			0,
-			pcntl_wexitstatus($childStatus),
-			"the $behavior scenario failed inside its isolated process"
-			. ': ' . @file_get_contents(sys_get_temp_dir() . '/adv-child-' . $runId . '.err'),
-		);
 
-		// Child cleanup evidence: nothing matching the unique run id remains.
-		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $survivors, $pgrepExit);
-		$this->assertSame(
-			1,
-			$pgrepExit,
-			"child processes survived cleanup for run $runId:\n" . implode("\n", $survivors),
+		if ($waitError) {
+			return [
+				'exitcode' => -1, 'signaled' => false, 'signal' => null,
+				'timedOut' => false, 'survivors' => false, 'runId' => $runId,
+				'detail' => 'pcntl_waitpid failed', 'waitError' => true,
+			];
+		}
+
+		$detail = '';
+		if (is_file($diagnosticFile)) {
+			$detail = (string)file_get_contents($diagnosticFile);
+			@unlink($diagnosticFile);
+		}
+
+		if (pcntl_wifsignaled($childStatus)) {
+			$signal = pcntl_wtermsig($childStatus);
+			if ($watchdogFired && $signal === 9) {
+				// Our OWN watchdog SIGKILLed the hung test child: that is
+				// the timeout path, not an unexpected signal death.
+				return [
+					'exitcode' => -1, 'signaled' => false, 'signal' => $signal,
+					'timedOut' => true, 'survivors' => $this->runHasSurvivors($runId),
+					'runId' => $runId, 'detail' => $detail, 'waitError' => false,
+				];
+			}
+
+			return [
+				'exitcode' => -1, 'signaled' => true, 'signal' => $signal,
+				'timedOut' => false, 'survivors' => false, 'runId' => $runId,
+				'detail' => $detail, 'waitError' => false,
+			];
+		}
+
+		$exitcode = pcntl_wifexited($childStatus) ? pcntl_wexitstatus($childStatus) : -1;
+
+		return [
+			'exitcode' => $exitcode,
+			'signaled' => false,
+			'signal' => null,
+			'timedOut' => $watchdogFired,
+			'survivors' => $this->runHasSurvivors($runId),
+			'runId' => $runId,
+			'detail' => $detail,
+			'waitError' => false,
+		];
+	}
+
+	/**
+	 * Narrowly scoped cleanup: kill only processes whose command line
+	 * carries THIS run's unique identifier. Never kills unrelated
+	 * processes.
+	 */
+	private function killRunProcesses(string $runId): void {
+		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $pids);
+		foreach ($pids as $pid) {
+			if (ctype_digit($pid) && (int)$pid !== getmypid()) {
+				posix_kill((int)$pid, 9); // SIGKILL
+			}
+		}
+	}
+
+	private function runHasSurvivors(string $runId): bool {
+		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $pids, $pgrepExit);
+
+		return $pgrepExit !== 1;
+	}
+
+	/**
+	 * CONCURRENT I/O REGRESSION: a child that fills the stderr pipe
+	 * before reading a large request must complete successfully — the
+	 * client has to drain stderr while it is still transmitting.
+	 * (stdout noise would violate the strict one-line contract, so the
+	 * pipe-filling happens on stderr.)
+	 */
+	public function testConcurrentWriteAndDrainUnderBackpressureSucceeds(): void {
+		$this->adversarialScenario('fills_pipes_then_valid', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, backpressure interleave ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$payload = $this->craftPayload(
+				base64_encode(str_repeat('d', 660000)),
+				SigningInputType::Digest,
+				SignatureAlgorithm::RsaPkcs1V15,
+				SignatureEncoding::RsaPkcs1,
+			);
+			$started = microtime(true);
+			$response = $record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+				$record->operationId,
+				$credential['credentialRef'],
+				$credential['certificateSha256'],
+				$payload,
+			));
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame($record->operationId, $response->operationId, 'a valid response behind filled pipes must still be correlated and accepted');
+		}, clientTimeoutSeconds: 8.0, requestLimit: 1048576);
+	}
+
+	/**
+	 * Sustained continuous STDERR exercises deadline checks inside the
+	 * drain path: the exchange must end at the deadline, bounded.
+	 */
+	public function testContinuousStderrHitsDeadlineInsideDrain(): void {
+		$this->adversarialScenario('continuous_stderr', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('Local card proof, continuous stderr ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('continuous stderr without a response must hit the deadline');
+			} catch (SignerTimeoutException) {
+				$this->addToAssertionCount(1);
+			}
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, microtime(true) - $started);
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+		}, clientTimeoutSeconds: 1.5);
+	}
+
+	/**
+	 * Explicit pre-spawn behavior when confirmed termination facilities
+	 * are unavailable: the client refuses to launch a signer process at
+	 * all. No child is ever spawned.
+	 */
+	public function testMissingTerminationFacilitiesRefuseToLaunch(): void {
+		$runId = 'adv-noposix-' . uniqid();
+		$adversarialScript = $this->adversarialScript;
+		$pythonBinary = $this->pythonBinary();
+		$client = new LocalSignerClient(
+			$pythonBinary,
+			$adversarialScript,
+			null,
+			1.0,
+			commandOverride: static fn (string $subcommand): array => [
+				$pythonBinary,
+				'-B',
+				$adversarialScript,
+				'clean_exit',
+				$runId,
+			],
+			terminationSupport: false,
 		);
+		$rsa = $this->credentialByRef('synthetic-rsa-leaf');
+		try {
+			$client->discover();
+			$this->fail('a client without confirmed-termination facilities must refuse to launch a child');
+		} catch (SignerProtocolException $exception) {
+			$this->assertSame(LocalSignerClient::REASON_TERMINATION_UNSUPPORTED, $exception->reason);
+		}
+		$this->assertFalse($this->runHasSurvivors($runId), 'no child may be spawned when termination facilities are unavailable');
+	}
+
+	/**
+	 * WATCHDOG META-REGRESSION: the isolation machinery itself must not
+	 * produce false results. All four cases run through the SAME
+	 * runIsolatedScenario() machinery the adversarial tests use, inside
+	 * this test, so the suite still finishes successfully when the
+	 * watchdog behaves correctly.
+	 */
+	public function testWatchdogCannotProduceFalseResults(): void {
+		// 1. A normal successful scenario is accepted (exit 0, no signal,
+		//    no timeout, no survivors).
+		$success = $this->runIsolatedScenario('clean_exit', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('watchdog meta, success ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+				$record->operationId,
+				$credential['credentialRef'],
+				$credential['certificateSha256'],
+				$prepared->upstream->payload,
+			));
+		}, 8.0);
+		$this->assertSame(0, $success['exitcode'], $success['detail']);
+		$this->assertFalse($success['signaled']);
+		$this->assertFalse($success['timedOut']);
+		$this->assertFalse($success['survivors']);
+
+		// 2. A scenario ASSERTION failure reaches the parent as failure.
+		$assertionFailure = $this->runIsolatedScenario('clean_exit', function (LocalSignerClient $client, string $runId): void {
+			$this->fail('deliberate assertion failure for the watchdog meta-regression');
+		}, 8.0);
+		$this->assertNotSame(0, $assertionFailure['exitcode'], 'an assertion failure inside the isolated process must not look like success');
+		$this->assertStringContainsString('deliberate assertion failure', $assertionFailure['detail']);
+
+		// 3. A SIGNAL-KILLED test child cannot be mistaken for success.
+		$signaled = $this->runIsolatedScenario('never_reads', function (LocalSignerClient $client, string $runId): void {
+			// Simulate a test child killed by a signal: kill OUR OWN
+			// isolated process. The unique run id is in its argv, so the
+			// scoped kill finds it.
+			exec('pkill -9 -f ' . escapeshellarg($runId));
+			// Give the signal a moment to land; never return normally.
+			usleep(500000);
+			posix_kill(getmypid(), 9); // SIGKILL self: hard signal exit
+		}, 8.0);
+		$this->assertTrue($signaled['signaled'], 'a signal-killed test child must be classified as signaled');
+		$this->assertNotNull($signaled['signal']);
+		$this->assertNotSame(0, $signaled['exitcode']);
+
+		// 4. A deliberately HUNG scenario trips the outer watchdog and
+		//    leaves no signer survivor.
+		$hung = $this->runIsolatedScenario('never_reads', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('watchdog meta, hung ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			// A scenario that ignores every failure and waits forever:
+			// only the outer watchdog can end it.
+			try {
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+			} catch (\Throwable) {
+				// Swallow: the scenario pretends everything is fine.
+			}
+			sleep(3600);
+		}, 1.0);
+		$this->assertTrue($hung['timedOut'], 'a hung scenario must trip the outer watchdog: ' . var_export($hung, true));
+		$this->assertFalse($hung['survivors'], 'after the watchdog fired, no signer process may survive');
 	}
 
 	public function testMalformedAndOversizedResponsesAreDistinguishedRejections(): void {
