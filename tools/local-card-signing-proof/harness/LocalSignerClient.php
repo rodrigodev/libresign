@@ -45,8 +45,12 @@ use SignerPHP\PdfSigner\Application\DTO\ExternalSigningPayload;
  * is OBSERVED; the FIRST captured terminal status is preserved and not
  * replaced by `proc_close()`'s return. If termination cannot be
  * confirmed, this client THROWS (`REASON_TERMINATION_UNCONFIRMED`)
- * instead of blocking or claiming guaranteed cleanup; the child may
- * leak in that case and the operation stays uncertain. Limitation:
+ * and marks cleanup exhausted; the child may leak in that case and the
+ * operation stays uncertain. Delivery of that error is NOT guaranteed
+ * to be prompt: PHP destroys the process resource when its reference
+ * leaves scope and that destruction waits for the child. The
+ * independent outer watchdog (kill by pid, bounded) is the containment
+ * for this unsupported environmental condition. Limitation:
  * cleanup covers the DIRECT child only; descendants are not tracked.
  * The proof fixtures never spawn any.
  *

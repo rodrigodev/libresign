@@ -728,8 +728,9 @@ final class LocalCardSigningProofTest extends TestCase {
 		callable $scenario,
 		float $clientTimeoutSeconds = 4.0,
 		int $requestLimit = LocalSignerClient::MAX_REQUEST_BYTES,
+		?\Closure $statusProbe = null,
 	): void {
-		$result = $this->runIsolatedScenario($behavior, $scenario, $clientTimeoutSeconds, $requestLimit);
+		$result = $this->runIsolatedScenario($behavior, $scenario, $clientTimeoutSeconds, $requestLimit, $statusProbe);
 		$this->assertSame(
 			0,
 			$result['exitcode'],
@@ -772,6 +773,7 @@ final class LocalCardSigningProofTest extends TestCase {
 		callable $scenario,
 		float $clientTimeoutSeconds = 4.0,
 		int $requestLimit = LocalSignerClient::MAX_REQUEST_BYTES,
+		?\Closure $statusProbe = null,
 	): array {
 		if (! function_exists('pcntl_fork')) {
 			$this->markTestSkipped('pcntl is unavailable; the independent outer timeout cannot be provided.');
@@ -779,20 +781,34 @@ final class LocalCardSigningProofTest extends TestCase {
 		$runId = 'adv-' . uniqid();
 		$adversarialScript = $this->adversarialScript;
 		$pythonBinary = $this->pythonBinary();
-		$buildClient = static fn (): LocalSignerClient => new LocalSignerClient(
-			$pythonBinary,
-			$adversarialScript,
-			null,
-			$clientTimeoutSeconds,
-			$requestLimit,
-			commandOverride: static fn (string $subcommand): array => [
+		// Precise process-identity tracking: the child records its own pid
+		// in this per-run file (see adversarial_children.py). Cleanup and
+		// survivor checks use ONLY these recorded pids plus an identity
+		// check — never broad command-line matching, which matches the
+		// checking shell itself.
+		$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
+		mkdir($runDirectory, 0700, true);
+		$pidfilePath = $runDirectory . '/signer.pids';
+		$buildClient = function () use ($pythonBinary, $adversarialScript, $clientTimeoutSeconds, $requestLimit, $behavior, $runId, $pidfilePath, $statusProbe): LocalSignerClient {
+			$client = new LocalSignerClient(
 				$pythonBinary,
-				'-B',
 				$adversarialScript,
-				$behavior,
-				$runId,
-			],
-		);
+				null,
+				$clientTimeoutSeconds,
+				$requestLimit,
+				commandOverride: static fn (string $subcommand): array => [
+					$pythonBinary,
+					'-B',
+					$adversarialScript,
+					$behavior,
+					$runId,
+					$pidfilePath,
+				],
+				statusProbe: $statusProbe,
+			);
+
+			return $client;
+		};
 
 		$diagnosticFile = sys_get_temp_dir() . '/adv-child-' . $runId . '.err';
 		$childPid = pcntl_fork();
@@ -895,23 +911,102 @@ final class LocalCardSigningProofTest extends TestCase {
 	}
 
 	/**
-	 * Narrowly scoped cleanup: kill only processes whose command line
-	 * carries THIS run's unique identifier. Never kills unrelated
-	 * processes.
+	 * Narrowly scoped cleanup from PRECISE process records: read the pids
+	 * the child itself wrote to its per-run pidfile, verify each pid's
+	 * identity against our own adversarial script (protecting against PID
+	 * reuse), then SIGKILL. Never touches the checking shell, unrelated
+	 * processes or guessed pids. Returns false when process inspection
+	 * itself failed — an error, NOT evidence that cleanup succeeded.
 	 */
-	private function killRunProcesses(string $runId): void {
-		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $pids);
-		foreach ($pids as $pid) {
-			if (ctype_digit($pid) && (int)$pid !== getmypid()) {
-				posix_kill((int)$pid, 9); // SIGKILL
+	private function killRunProcesses(string $runId): bool {
+		$inspectionFailed = false;
+		foreach ($this->recordedRunPids($runId) as $pid) {
+			if ($pid === getmypid()) {
+				continue;
+			}
+			$commandLine = $this->processCommandLine($pid, $inspectionFailed);
+			if ($inspectionFailed) {
+				return false;
+			}
+			// Identity check: only kill what we can prove is OUR child.
+			if ($commandLine !== null && str_contains($commandLine, 'adversarial_children.py')) {
+				posix_kill($pid, 9); // SIGKILL
 			}
 		}
+
+		return true;
 	}
 
+	/**
+	 * True when a recorded, identity-verified signer process is STILL
+	 * alive. Process-inspection failures are reported as errors (by
+	 * throwing) — they are never treated as evidence of success.
+	 */
 	private function runHasSurvivors(string $runId): bool {
-		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $pids, $pgrepExit);
+		foreach ($this->recordedRunPids($runId) as $pid) {
+			if ($pid === getmypid()) {
+				continue;
+			}
+			// Liveness probe: signal 0. ESRCH means gone; success or EPERM
+			// means the process exists.
+			$alive = posix_kill($pid, 0);
+			if ($alive) {
+				return true;
+			}
+			$lastError = posix_get_last_error();
+			if ($lastError !== 3) { // 3 = ESRCH (no such process)
+				throw new \RuntimeException(sprintf(
+					'process inspection failed for pid %d (run %s): %s',
+					$pid,
+					$runId,
+					posix_strerror($lastError),
+				));
+			}
+			// Gone from the signal perspective, but confirm identity via
+			// ps to catch transient states.
+			$inspectionFailed = false;
+			$commandLine = $this->processCommandLine($pid, $inspectionFailed);
+			if ($inspectionFailed) {
+				throw new \RuntimeException("process inspection failed for pid {$pid} (run {$runId})");
+			}
+			if ($commandLine !== null && str_contains($commandLine, 'adversarial_children.py')) {
+				return true;
+			}
+		}
 
-		return $pgrepExit !== 1;
+		return false;
+	}
+
+	/**
+	 * @return list<int>
+	 */
+	private function recordedRunPids(string $runId): array {
+		$pids = [];
+		foreach (glob(sys_get_temp_dir() . '/lcs-proof-' . $runId . '/*.pids') ?: [] as $pidfile) {
+			foreach (file($pidfile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+				if (ctype_digit($line)) {
+					$pids[] = (int)$line;
+				}
+			}
+		}
+
+		return $pids;
+	}
+
+	/**
+	 * Command line of one pid, or null when the process does not exist.
+	 * Sets $inspectionFailed and returns a sentinel when ps itself fails
+	 * (exit code > 1) — inspection errors are errors, not "no survivor".
+	 */
+	private function processCommandLine(int $pid, bool &$inspectionFailed): ?string {
+		exec(sprintf('ps -p %d -o command=', $pid), $lines, $exitCode);
+		if ($exitCode > 1) {
+			$inspectionFailed = true;
+
+			return null;
+		}
+
+		return $lines[0] ?? null;
 	}
 
 	/**
@@ -1008,9 +1103,10 @@ final class LocalCardSigningProofTest extends TestCase {
 	/**
 	 * FAULT-INJECTION REGRESSION for the unconfirmed-termination path.
 	 *
-	 * The status probe inside terminateConfirmed() is replaced by one
-	 * that NEVER observes exit — an INJECTED confirmation failure. The
-	 * real SIGTERM/SIGKILL still reach the real child pid. Expected:
+	 * Uses the SHARED isolation machinery (runIsolatedScenario, with its
+	 * finally-guaranteed cleanup) and only injects a status probe that
+	 * NEVER observes exit — an INJECTED confirmation failure. The real
+	 * SIGTERM/SIGKILL still reach the real child pid. Expected:
 	 * `termination-unconfirmed` is thrown, the scenario stays bounded
 	 * inside the independent outer watchdog, cleanup is not retried, and
 	 * no signer survivor remains.
@@ -1024,94 +1120,45 @@ final class LocalCardSigningProofTest extends TestCase {
 	 * containment for that environmental condition.
 	 */
 	public function testInjectedTerminationConfirmationFailureIsReportedBounded(): void {
-		if (! function_exists('pcntl_fork')) {
-			$this->markTestSkipped('pcntl is unavailable; the independent outer timeout cannot be provided.');
-		}
-		$runId = 'adv-unconfirmed-' . uniqid();
-		$adversarialScript = $this->adversarialScript;
-		$pythonBinary = $this->pythonBinary();
-		$childPid = pcntl_fork();
-		if ($childPid === -1) {
-			$this->markTestSkipped('pcntl_fork failed; the independent outer timeout cannot be provided.');
-		}
-		if ($childPid === 0) {
+		$realPid = 0;
+		$this->adversarialScenario('never_reads', function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('fault injection, unconfirmed ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$started = microtime(true);
 			try {
-				$realPid = 0;
-				$probe = static function ($proc) use (&$realPid): array {
-					$real = proc_get_status($proc);
-					if ($real['running']) {
-						$realPid = $real['pid'];
-					}
+				$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+					$record->operationId,
+					$credential['credentialRef'],
+					$credential['certificateSha256'],
+					$prepared->upstream->payload,
+				));
+				$this->fail('an unconfirmable termination must be reported');
+			} catch (SignerProtocolException $exception) {
+				$this->assertSame(LocalSignerClient::REASON_TERMINATION_UNCONFIRMED, $exception->reason);
+			}
+			$elapsed = microtime(true) - $started;
+			$this->assertLessThan(self::OUTER_TIMEOUT_SECONDS, $elapsed, 'the injected failure must surface inside a bounded window');
+			$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
+			try {
+				$record->completeWith(fn (): string => 'never');
+				$this->fail('an uncertain operation must not be completable');
+			} catch (\LogicException) {
+				$this->addToAssertionCount(1);
+			}
+		}, clientTimeoutSeconds: 0.5, statusProbe: static function ($proc) use (&$realPid): array {
+			// INJECTED confirmation failure: the probe never observes exit.
+			// The first call captures the REAL pid (from one genuine
+			// proc_get_status) so the SIGTERM/SIGKILL still hit the actual
+			// child.
+			$real = proc_get_status($proc);
+			if ($real['running']) {
+				$realPid = $real['pid'];
+			}
 
-					return ['running' => true, 'pid' => $realPid ?: 999999];
-				};
-				$client = new LocalSignerClient(
-					$pythonBinary,
-					$adversarialScript,
-					null,
-					0.5,
-					commandOverride: static fn (string $subcommand): array => [
-						$pythonBinary,
-						'-B',
-						$adversarialScript,
-						'never_reads',
-						$runId,
-					],
-					statusProbe: $probe,
-				);
-				$credential = $this->credentialByRef('synthetic-rsa-leaf');
-				$pdf = $this->makePdf('fault injection, unconfirmed ' . $runId);
-				$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
-				$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
-				$started = microtime(true);
-				try {
-					$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
-						$record->operationId,
-						$credential['credentialRef'],
-						$credential['certificateSha256'],
-						$prepared->upstream->payload,
-					));
-					$this->fail('an unconfirmable termination must be reported');
-				} catch (SignerProtocolException $exception) {
-					$this->assertSame(LocalSignerClient::REASON_TERMINATION_UNCONFIRMED, $exception->reason);
-				}
-				$elapsed = microtime(true) - $started;
-				$this->assertLessThan(15.0, $elapsed, 'the injected failure must surface inside a bounded window');
-				$this->assertSame(ProofOperationRecord::STATE_UNCERTAIN, $record->getState());
-				exit(0);
-			} catch (\Throwable $childFailure) {
-				file_put_contents(sys_get_temp_dir() . '/adv-child-' . $runId . '.err', (string)$childFailure);
-				exit(1);
-			}
-		}
-
-		// Independent outer watchdog, monotonic clock.
-		$outerDeadlineNs = hrtime(true) + self::OUTER_TIMEOUT_SECONDS * 1_000_000_000;
-		$childStatus = 0;
-		$reaped = false;
-		while (hrtime(true) < $outerDeadlineNs) {
-			$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
-			if ($waited === $childPid) {
-				$reaped = true;
-				break;
-			}
-			if ($waited === -1) {
-				break;
-			}
-			usleep(50000);
-		}
-		$this->assertTrue($reaped, 'the fault-injection scenario must finish inside the independent outer timeout');
-		$this->assertTrue(pcntl_wifexited($childStatus), 'the fault-injection test child must exit normally, not by signal');
-		$this->assertSame(0, pcntl_wexitstatus($childStatus));
-
-		// Cleanup + evidence: no signer survivor for this run id.
-		exec('pgrep -f ' . escapeshellarg($runId) . ' 2>/dev/null', $survivors, $pgrepExit);
-		foreach ($survivors as $pid) {
-			if (ctype_digit($pid)) {
-				posix_kill((int)$pid, 9); // SIGKILL
-			}
-		}
-		$this->assertSame(1, $pgrepExit, 'ordinary child processes must not survive: ' . implode(', ', $survivors));
+			return ['running' => true, 'pid' => $realPid ?: 999999];
+		});
 	}
 
 	/**
@@ -1185,6 +1232,78 @@ final class LocalCardSigningProofTest extends TestCase {
 		}, 1.0);
 		$this->assertTrue($hung['timedOut'], 'a hung scenario must trip the outer watchdog: ' . var_export($hung, true));
 		$this->assertFalse($hung['survivors'], 'after the watchdog fired, no signer process may survive');
+	}
+
+	/**
+	 * SURVIVOR DETECTION: an EMPTY process-record set must be reported as
+	 * clean — with no inspection errors and no false positives from
+	 * command-line matching.
+	 */
+	public function testSurvivorDetectionWithNoRecordedProcessesIsClean(): void {
+		$runId = 'adv-empty-' . uniqid();
+		mkdir(sys_get_temp_dir() . '/lcs-proof-' . $runId, 0700, true);
+		$this->assertFalse($this->runHasSurvivors($runId), 'an empty process set has no survivors');
+		$this->assertTrue($this->killRunProcesses($runId), 'cleanup over an empty process set must succeed');
+		$this->assertFalse($this->runHasSurvivors($runId));
+	}
+
+	/**
+	 * SURVIVOR DETECTION: a deliberately LIVE signer recorded in the run
+	 * pidfile must be detected, cleaned up, and gone afterwards. This
+	 * proves the pidfile/identity machinery finds real survivors — the
+	 * reviewer reproduced false negatives and shell self-matches with
+	 * broad `pgrep -f` matching, which this machinery no longer uses.
+	 */
+	public function testDeliberatelyLiveSignerIsDetectedAndCleaned(): void {
+		$runId = 'adv-live-' . uniqid();
+		$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
+		mkdir($runDirectory, 0700, true);
+		$pidfilePath = $runDirectory . '/signer.pids';
+		$adversarialScript = $this->adversarialScript;
+		$pythonBinary = $this->pythonBinary();
+		$process = proc_open(
+			[$pythonBinary, '-B', $adversarialScript, 'never_reads', $runId, $pidfilePath],
+			[['pipe', 'r'], ['pipe', 'w'], ['file', '/dev/null', 'w']],
+			$pipes,
+		);
+		$this->assertIsResource($process);
+		fclose($pipes[0]);
+		fclose($pipes[1]);
+
+		// Wait until the child has recorded its pid.
+		$deadlineNs = hrtime(true) + 5_000_000_000;
+		while (! is_file($pidfilePath) && hrtime(true) < $deadlineNs) {
+			usleep(50000);
+		}
+		$this->assertFileExists($pidfilePath, 'the child must record its pid');
+		$this->assertTrue($this->runHasSurvivors($runId), 'a deliberately live signer must be detected');
+
+		// The pidfile pid must be confirmed as OUR adversarial script —
+		// precise identity, not a reused or unrelated pid.
+		foreach ($this->recordedRunPids($runId) as $pid) {
+			$inspectionFailed = false;
+			$commandLine = $this->processCommandLine($pid, $inspectionFailed);
+			$this->assertFalse($inspectionFailed);
+			$this->assertNotNull($commandLine);
+			$this->assertStringContainsString('adversarial_children.py', (string)$commandLine);
+		}
+
+		// Bounded cleanup, then gone. The test owns the process handle, so
+		// it must REAP the SIGKILLed child (otherwise it stays a zombie,
+		// which a signal-0 liveness probe legitimately still sees).
+		$this->assertTrue($this->killRunProcesses($runId));
+		usleep(200000);
+		proc_close($process);
+		$deadlineNs = hrtime(true) + 5_000_000_000;
+		do {
+			$gone = ! $this->runHasSurvivors($runId);
+			if ($gone) {
+				break;
+			}
+			usleep(100000);
+		} while (hrtime(true) < $deadlineNs);
+		$this->assertFalse($this->runHasSurvivors($runId), 'cleanup must leave no signer survivor');
+		@rmdir($runDirectory);
 	}
 
 	public function testMalformedAndOversizedResponsesAreDistinguishedRejections(): void {

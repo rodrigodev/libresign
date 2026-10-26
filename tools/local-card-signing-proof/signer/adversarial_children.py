@@ -137,6 +137,13 @@ def main():
         sys.stderr.write("unknown behavior %r\n" % behavior)
         sys.exit(9)
     tag(behavior)
+    # Precise process-identity tracking (watchdog cleanup): the child
+    # records its OWN pid in a per-run pidfile passed as argv[3]. The
+    # harness uses this file instead of broad command-line matching,
+    # which famously matches the checking shell itself.
+    if len(sys.argv) > 3:
+        with open(sys.argv[3], "w", encoding="ascii") as handle:
+            handle.write(str(os.getpid()) + "\n")
     handler()
     if behavior in KEEP_ALIVE:
         time.sleep(3600)  # these behaviors must never exit on their own

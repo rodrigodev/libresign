@@ -1,0 +1,113 @@
+<?php
+// TEMPORARY proof-specific PHPUnit stub (issue #8356 local-signing proof).
+// Minimal PHPUnit\Framework\TestCase declaration so Psalm can resolve the
+// parent chain of OCA\Libresign\Tests\Integration\TestCase when PHPUnit
+// classes are not loaded. Methods carry loose signatures on purpose: the
+// stub provides RESOLUTION, not behavioral typing.
+
+namespace PHPUnit\Framework;
+
+abstract class TestCase {
+    public static function setUpBeforeClass(): void
+    {
+    }
+
+    protected function setUp(): void
+    {
+    }
+
+    protected function tearDown(): void
+    {
+    }
+
+    public static function fail(string $message = ''): never
+    {
+        throw new \RuntimeException($message);
+    }
+
+    public function markTestSkipped(string $message = ''): never
+    {
+        throw new \RuntimeException($message);
+    }
+
+    public function addToAssertionCount(int $count): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertTrue(mixed $condition, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertFalse(mixed $condition, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertSame(mixed $expected, mixed $actual, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertNotSame(mixed $expected, mixed $actual, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertCount(int $expected, mixed $haystack, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertContains(mixed $needle, iterable $haystack, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertLessThan(mixed $maximum, mixed $actual, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertNotNull(mixed $actual, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertNotInstanceOf(string $expected, mixed $actual, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertStringContainsString(string $needle, string $haystack, string $message = ''): void
+    {
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function assertStringContainsStringIgnoringCase(string $needle, string $haystack, string $message = ''): void
+    {
+    }
+}

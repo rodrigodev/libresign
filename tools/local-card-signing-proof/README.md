@@ -234,20 +234,32 @@ never parsed console output).
 
 Proof-specific Psalm analysis: the application's `psalm.xml` analyzes
 `lib/` ONLY, so a default application scan does NOT cover the proof.
-The targeted analysis instead uses a temporary proof-specific config
-(`psalm-proof.xml`, not committed) whose `projectFiles` are exactly the
-PHP the proof adds (`tools/local-card-signing-proof/harness/`,
-`tests/php/Integration/Tools/`) and whose `extraFiles` carry the
-dependencies needed to resolve the test base classes (app `lib/`,
-server `lib/`, server `tests/lib/`, the integration `TestCase` and the
-#9216 subprocess infrastructure). Run:
+A committed generator creates a temporary proof-specific config whose
+`projectFiles` are exactly the PHP the proof adds
+(`tools/local-card-signing-proof/harness/`,
+`tests/php/Integration/Tools/`); `extraFiles` resolve the dependencies
+(app `lib/`, Nextcloud server `lib/`, server `tests/lib/`, the
+integration `TestCase`, the app `AppConfigOverwrite` helper and the
+#9216 subprocess infrastructure). A minimal committed PHPUnit stub
+(`psalm/phpunit-testcase.phpstub`) provides parent-chain RESOLUTION
+only — the analysis process does not load PHPUnit classes, so
+behavioral typing of inherited test helpers is limited by design. The
+production `psalm.xml`, baseline and error level are never modified
+and no suppressions are added.
+
+One exact command (from the APP checkout, PHP >= 8.3, Psalm from
+`vendor-bin/psalm`):
 
 ```bash
+php tools/local-card-signing-proof/psalm/generate-config.php \
+  --server-root=/path/to/nextcloud-server
 CI=1 vendor-bin/psalm/vendor/bin/psalm --no-cache --threads=4 \
   -c psalm-proof.xml
 ```
 
-php-cs-fixer runs over the same added paths. The `tools/` PHP harness
-is NOT part of the application autoloader and is loaded explicitly by
-the test. See the handoff reports for the recorded results, exit codes
-and any subset-scan diagnostics.
+The generator verifies the checkout (wrong checkouts fail early) and
+writes `psalm-proof.xml` into the app root; that file is GENERATED and
+must not be committed. php-cs-fixer runs over the same added paths.
+The `tools/` PHP harness is NOT part of the application autoloader and
+is loaded explicitly by the test. Recorded results, exit codes and
+subset-scan diagnostics are in the handoff reports.
