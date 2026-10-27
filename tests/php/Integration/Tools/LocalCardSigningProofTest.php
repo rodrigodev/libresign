@@ -745,8 +745,17 @@ final class LocalCardSigningProofTest extends TestCase {
 			"the $behavior scenario exceeded the independent outer timeout",
 		);
 		$this->assertFalse(
-			$result['survivors'],
-			"child processes survived cleanup for run {$result['runId']}",
+			$result['waitError'],
+			"the $behavior scenario hit a wait failure",
+		);
+		$this->assertSame(
+			[],
+			$result['cleanupErrors'],
+			"the $behavior scenario must clean up without errors",
+		);
+		$this->assertFalse(
+			(bool)$result['survivors'],
+			"child processes survived cleanup for run {$result['runId']} (null = unknown, also a failure)",
 		);
 	}
 
@@ -774,6 +783,7 @@ final class LocalCardSigningProofTest extends TestCase {
 		float $clientTimeoutSeconds = 4.0,
 		int $requestLimit = LocalSignerClient::MAX_REQUEST_BYTES,
 		?\Closure $statusProbe = null,
+		array $faults = [],
 	): array {
 		if (! function_exists('pcntl_fork')) {
 			$this->markTestSkipped('pcntl is unavailable; the independent outer timeout cannot be provided.');
@@ -784,8 +794,9 @@ final class LocalCardSigningProofTest extends TestCase {
 		// Precise process-identity tracking: the child records its own pid
 		// in this per-run file (see adversarial_children.py). Cleanup and
 		// survivor checks use ONLY these recorded pids plus an identity
-		// check — never broad command-line matching, which matches the
-		// checking shell itself.
+		// check that requires BOTH the script filename AND THIS run's
+		// unique token in the live command line — so PID reuse and another
+		// run of the same script can never be signalled.
 		$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
 		mkdir($runDirectory, 0700, true);
 		$pidfilePath = $runDirectory . '/signer.pids';
@@ -830,6 +841,9 @@ final class LocalCardSigningProofTest extends TestCase {
 
 		// Parent: bounded wait on a monotonic clock, independent of the
 		// client under test. The waitpid result is consumed EXACTLY ONCE.
+		$cleanupErrors = [];
+		$detail = '';
+		$survivorsFinal = null;
 		$outerDeadlineNs = hrtime(true) + self::OUTER_TIMEOUT_SECONDS * 1_000_000_000;
 		$childStatus = 0;
 		$reaped = false;
@@ -846,35 +860,67 @@ final class LocalCardSigningProofTest extends TestCase {
 					$waitError = true;
 					break;
 				}
+				if (! empty($faults['wait-fails'])) {
+					// INJECTED wait failure: behave exactly as if waitpid
+					// had returned -1, then prove cleanup still runs and
+					// the failure is reported.
+					$waitError = true;
+					break;
+				}
 				usleep(50000);
 			}
 			if (! $reaped && ! $waitError) {
-				// Outer watchdog fired: kill the isolated test child, then
-				// any signer process it launched, and reap it.
+				// Outer watchdog fired: kill recorded signer processes, then
+				// the isolated test child, then reap with a BOUNDED
+				// nonblocking poll. No unbounded wait anywhere.
 				$watchdogFired = true;
-				$this->killRunProcesses($runId);
-				posix_kill($childPid, 9); // SIGKILL
-				$waited = pcntl_waitpid($childPid, $childStatus);
-				$reaped = $waited === $childPid;
+				$this->killRunProcesses($runId, $faults, $cleanupErrors);
+				$this->signalProcess($childPid, 9, $faults, $cleanupErrors, 'isolated test child');
+				$reapDeadlineNs = hrtime(true) + 5_000_000_000;
+				do {
+					$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
+					if ($waited === $childPid) {
+						$reaped = true;
+						break;
+					}
+					if ($waited === -1) {
+						$waitError = true;
+						break;
+					}
+					usleep(50000);
+				} while (hrtime(true) < $reapDeadlineNs);
+				if (! $reaped && ! $waitError) {
+					$cleanupErrors[] = 'the isolated test child could not be reaped within the bounded cleanup window';
+				}
 			}
 		} finally {
-			// Runs when the scenario failed, the test child crashed, or
-			// the watchdog fired: kill any signer survivor by run id.
-			$this->killRunProcesses($runId);
+			// Runs on success, assertion failure, child crash, watchdog
+			// firing and wait errors: signer cleanup + record removal.
+			$this->killRunProcesses($runId, $faults, $cleanupErrors);
+			// Survivor status MUST be decided while the run's records are
+			// still in place — after deletion the answer would be a
+			// vacuous false.
+			$survivorsFinal = $this->runHasSurvivors($runId, $faults, $cleanupErrors);
+			if (is_file($diagnosticFile)) {
+				$detail = (string)file_get_contents($diagnosticFile);
+				@unlink($diagnosticFile);
+				if ($detail !== '') {
+					$cleanupErrors[] = 'the isolated scenario reported: ' . $detail;
+				}
+			}
+			foreach (glob($runDirectory . '/*.pids') ?: [] as $pidfile) {
+				@unlink($pidfile);
+			}
+			@rmdir($runDirectory);
 		}
 
 		if ($waitError) {
 			return [
 				'exitcode' => -1, 'signaled' => false, 'signal' => null,
-				'timedOut' => false, 'survivors' => false, 'runId' => $runId,
+				'timedOut' => false, 'survivors' => $survivorsFinal, 'runId' => $runId,
 				'detail' => 'pcntl_waitpid failed', 'waitError' => true,
+				'cleanupErrors' => $cleanupErrors,
 			];
-		}
-
-		$detail = '';
-		if (is_file($diagnosticFile)) {
-			$detail = (string)file_get_contents($diagnosticFile);
-			@unlink($diagnosticFile);
 		}
 
 		if (pcntl_wifsignaled($childStatus)) {
@@ -884,15 +930,17 @@ final class LocalCardSigningProofTest extends TestCase {
 				// the timeout path, not an unexpected signal death.
 				return [
 					'exitcode' => -1, 'signaled' => false, 'signal' => $signal,
-					'timedOut' => true, 'survivors' => $this->runHasSurvivors($runId),
+					'timedOut' => true, 'survivors' => $survivorsFinal,
 					'runId' => $runId, 'detail' => $detail, 'waitError' => false,
+					'cleanupErrors' => $cleanupErrors,
 				];
 			}
 
 			return [
 				'exitcode' => -1, 'signaled' => true, 'signal' => $signal,
-				'timedOut' => false, 'survivors' => false, 'runId' => $runId,
+				'timedOut' => false, 'survivors' => $survivorsFinal, 'runId' => $runId,
 				'detail' => $detail, 'waitError' => false,
+				'cleanupErrors' => $cleanupErrors,
 			];
 		}
 
@@ -903,49 +951,78 @@ final class LocalCardSigningProofTest extends TestCase {
 			'signaled' => false,
 			'signal' => null,
 			'timedOut' => $watchdogFired,
-			'survivors' => $this->runHasSurvivors($runId),
+			'survivors' => $survivorsFinal,
 			'runId' => $runId,
 			'detail' => $detail,
 			'waitError' => false,
+			'cleanupErrors' => $cleanupErrors,
 		];
 	}
 
 	/**
-	 * Narrowly scoped cleanup from PRECISE process records: read the pids
-	 * the child itself wrote to its per-run pidfile, verify each pid's
-	 * identity against our own adversarial script (protecting against PID
-	 * reuse), then SIGKILL. Never touches the checking shell, unrelated
-	 * processes or guessed pids. Returns false when process inspection
-	 * itself failed — an error, NOT evidence that cleanup succeeded.
+	 * Narrowly scoped cleanup from PRECISE process records. Reads the pids
+	 * the child itself wrote to its per-run pidfile, verifies each pid's
+	 * identity (script filename AND this run's unique token in the live
+	 * command line — protecting against PID reuse and cross-run
+	 * signalling), then SIGKILLs. Collects EVERY error and keeps going:
+	 * an earlier failure never cancels the remaining cleanup attempts.
+	 * Process-inspection and signal failures land in $errors — they are
+	 * errors, never evidence of success.
 	 */
-	private function killRunProcesses(string $runId): bool {
-		$inspectionFailed = false;
-		foreach ($this->recordedRunPids($runId) as $pid) {
+	private function killRunProcesses(string $runId, array $faults, array &$errors): void {
+		foreach ($this->recordedRunPids($runId, $errors) as $pid) {
 			if ($pid === getmypid()) {
+				// A substituted record pointing at the CHECKER itself: the
+				// one process this harness must never signal.
+				$errors[] = sprintf(
+					'recorded pid %d (run %s) is the checking process itself; it was deliberately NOT signalled',
+					$pid,
+					$runId,
+				);
 				continue;
 			}
-			$commandLine = $this->processCommandLine($pid, $inspectionFailed);
-			if ($inspectionFailed) {
-				return false;
+			$identity = $this->processIdentity($pid, $runId, $faults, $errors);
+			if ($identity === null) {
+				continue; // already gone
 			}
-			// Identity check: only kill what we can prove is OUR child.
-			if ($commandLine !== null && str_contains($commandLine, 'adversarial_children.py')) {
-				posix_kill($pid, 9); // SIGKILL
+			if ($identity === true) {
+				$this->signalProcess($pid, 9, $faults, $errors, 'recorded signer ' . $pid);
+			}
+			// identity === false: the pid exists but is NOT our child (PID
+			// reuse or a substituted record). Never signalled; reported.
+			if ($identity === false) {
+				$errors[] = sprintf(
+					'recorded pid %d (run %s) is alive but its command line does not match this run;'
+					. ' it was deliberately NOT signalled',
+					$pid,
+					$runId,
+				);
 			}
 		}
-
-		return true;
 	}
 
 	/**
 	 * True when a recorded, identity-verified signer process is STILL
-	 * alive. Process-inspection failures are reported as errors (by
-	 * throwing) — they are never treated as evidence of success.
+	 * alive. false means every recorded pid is confirmed gone. When
+	 * inspection or liveness probing fails, the error is appended to
+	 * $errors and the answer is 'unknown' — NEVER a clean false. An alive
+	 * pid whose command line does NOT match this run is reported as a
+	 * mismatch error AND as a survivor (it is alive, but must never be
+	 * signalled).
+	 *
+	 * @return bool|null true = survivor, false = none, null = unknown
 	 */
-	private function runHasSurvivors(string $runId): bool {
-		foreach ($this->recordedRunPids($runId) as $pid) {
+	private function runHasSurvivors(string $runId, array $faults, array &$errors): ?bool {
+		foreach ($this->recordedRunPids($runId, $errors) as $pid) {
 			if ($pid === getmypid()) {
-				continue;
+				// The checking process itself: alive, but never signalled.
+				$errors[] = sprintf(
+					'recorded pid %d (run %s) is the checking process itself; the record was substituted',
+					$pid,
+					$runId,
+				);
+
+				return true;
 			}
 			// Liveness probe: signal 0. ESRCH means gone; success or EPERM
 			// means the process exists.
@@ -955,21 +1032,19 @@ final class LocalCardSigningProofTest extends TestCase {
 			}
 			$lastError = posix_get_last_error();
 			if ($lastError !== 3) { // 3 = ESRCH (no such process)
-				throw new \RuntimeException(sprintf(
+				$errors[] = sprintf(
 					'process inspection failed for pid %d (run %s): %s',
 					$pid,
 					$runId,
 					posix_strerror($lastError),
-				));
+				);
+
+				return null;
 			}
-			// Gone from the signal perspective, but confirm identity via
-			// ps to catch transient states.
-			$inspectionFailed = false;
-			$commandLine = $this->processCommandLine($pid, $inspectionFailed);
-			if ($inspectionFailed) {
-				throw new \RuntimeException("process inspection failed for pid {$pid} (run {$runId})");
-			}
-			if ($commandLine !== null && str_contains($commandLine, 'adversarial_children.py')) {
+			// Gone from the signal perspective; confirm identity via ps to
+			// catch transient states.
+			$identity = $this->processIdentity($pid, $runId, $faults, $errors);
+			if ($identity === true) {
 				return true;
 			}
 		}
@@ -980,13 +1055,24 @@ final class LocalCardSigningProofTest extends TestCase {
 	/**
 	 * @return list<int>
 	 */
-	private function recordedRunPids(string $runId): array {
+	private function recordedRunPids(string $runId, array &$errors): array {
+		$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
+		if (! is_dir($runDirectory)) {
+			return [];
+		}
 		$pids = [];
-		foreach (glob(sys_get_temp_dir() . '/lcs-proof-' . $runId . '/*.pids') ?: [] as $pidfile) {
-			foreach (file($pidfile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
-				if (ctype_digit($line)) {
-					$pids[] = (int)$line;
+		foreach (glob($runDirectory . '/*.pids') ?: [] as $pidfile) {
+			$lines = file($pidfile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+			if ($lines === false) {
+				$errors[] = "could not read process record {$pidfile}";
+				continue;
+			}
+			foreach ($lines as $line) {
+				if (preg_match('/^[0-9]+$/', $line) !== 1) {
+					$errors[] = "malformed process record '{$line}' in {$pidfile}";
+					continue;
 				}
+				$pids[] = (int)$line;
 			}
 		}
 
@@ -994,19 +1080,77 @@ final class LocalCardSigningProofTest extends TestCase {
 	}
 
 	/**
-	 * Command line of one pid, or null when the process does not exist.
-	 * Sets $inspectionFailed and returns a sentinel when ps itself fails
-	 * (exit code > 1) — inspection errors are errors, not "no survivor".
+	 * Identity of one recorded pid, with a fault seam.
+	 *
+	 * Returns true  — the process is alive and its command line contains
+	 *                 BOTH the proof's script filename AND this run's
+	 *                 unique token (so PID reuse and other runs of the
+	 *                 same script are excluded);
+	 *         false — the process is alive but is NOT this run's child
+	 *                 (never signalled), or it is already gone;
+	 *         null  — the process is already gone (same as false for
+	 *                 signalling decisions, distinct for reporting).
+	 *
+	 * faults['inspection-fails'] forces an inspection failure (injected).
+	 * Inspection failures append to $errors; they are never reported as a
+	 * clean identity answer.
 	 */
-	private function processCommandLine(int $pid, bool &$inspectionFailed): ?string {
-		exec(sprintf('ps -p %d -o command=', $pid), $lines, $exitCode);
-		if ($exitCode > 1) {
-			$inspectionFailed = true;
+	private function processIdentity(int $pid, string $runId, array $faults, array &$errors): ?bool {
+		if (! empty($faults['inspection-fails'])) {
+			$errors[] = sprintf('injected inspection failure for pid %d (run %s)', $pid, $runId);
 
 			return null;
 		}
+		if (isset($faults['identity-cmdline'])) {
+			// Controlled test double for PID reuse / another run: the
+			// recorded pid appears alive but with a FOREIGN command line.
+			return str_contains((string)$faults['identity-cmdline'], $runId);
+		}
+		exec(sprintf('ps -p %d -o command=', $pid), $lines, $exitCode);
+		if ($exitCode > 1) {
+			$errors[] = sprintf('process inspection failed for pid %d (ps exit %d)', $pid, $exitCode);
 
-		return $lines[0] ?? null;
+			return null;
+		}
+		$commandLine = $lines[0] ?? null;
+		if ($commandLine === null) {
+			return null; // process does not exist
+		}
+
+		return str_contains($commandLine, 'adversarial_children.py')
+			&& str_contains($commandLine, $runId);
+	}
+
+	/**
+	 * Send a signal with a fault seam. Returns true when the signal was
+	 * delivered; false when the target had ALREADY exited (ESRCH — not an
+	 * error); a genuine signal failure is appended to $errors and returns
+	 * false. faults['signal-fails'] forces a genuine-looking failure
+	 * (injected).
+	 */
+	private function signalProcess(int $pid, int $signalNumber, array $faults, array &$errors, string $label): bool {
+		if (! empty($faults['signal-fails'])) {
+			$errors[] = sprintf('injected signal failure for %s (pid %d, signal %d)', $label, $pid, $signalNumber);
+
+			return false;
+		}
+		$sent = posix_kill($pid, $signalNumber);
+		if ($sent) {
+			return true;
+		}
+		$lastError = posix_get_last_error();
+		if ($lastError === 3) { // ESRCH: already exited — not an error
+			return false;
+		}
+		$errors[] = sprintf(
+			'signal %d to %s (pid %d) failed: %s',
+			$signalNumber,
+			$label,
+			$pid,
+			posix_strerror($lastError),
+		);
+
+		return false;
 	}
 
 	/**
@@ -1097,7 +1241,9 @@ final class LocalCardSigningProofTest extends TestCase {
 		} catch (SignerProtocolException $exception) {
 			$this->assertSame(LocalSignerClient::REASON_TERMINATION_UNSUPPORTED, $exception->reason);
 		}
-		$this->assertFalse($this->runHasSurvivors($runId), 'no child may be spawned when termination facilities are unavailable');
+		$errors = [];
+		$this->assertFalse($this->runHasSurvivors($runId, [], $errors), 'no child may be spawned when termination facilities are unavailable');
+		$this->assertSame([], $errors);
 	}
 
 	/**
@@ -1242,9 +1388,12 @@ final class LocalCardSigningProofTest extends TestCase {
 	public function testSurvivorDetectionWithNoRecordedProcessesIsClean(): void {
 		$runId = 'adv-empty-' . uniqid();
 		mkdir(sys_get_temp_dir() . '/lcs-proof-' . $runId, 0700, true);
-		$this->assertFalse($this->runHasSurvivors($runId), 'an empty process set has no survivors');
-		$this->assertTrue($this->killRunProcesses($runId), 'cleanup over an empty process set must succeed');
-		$this->assertFalse($this->runHasSurvivors($runId));
+		$errors = [];
+		$this->assertFalse($this->runHasSurvivors($runId, [], $errors), 'an empty process set has no survivors');
+		$this->assertSame([], $errors);
+		$this->killRunProcesses($runId, [], $errors);
+		$this->assertSame([], $errors, 'cleanup over an empty process set must succeed');
+		$this->assertFalse($this->runHasSurvivors($runId, [], $errors));
 	}
 
 	/**
@@ -1276,33 +1425,224 @@ final class LocalCardSigningProofTest extends TestCase {
 			usleep(50000);
 		}
 		$this->assertFileExists($pidfilePath, 'the child must record its pid');
-		$this->assertTrue($this->runHasSurvivors($runId), 'a deliberately live signer must be detected');
+		$errors = [];
+		$this->assertTrue($this->runHasSurvivors($runId, [], $errors), 'a deliberately live signer must be detected');
+		$this->assertSame([], $errors);
 
 		// The pidfile pid must be confirmed as OUR adversarial script —
 		// precise identity, not a reused or unrelated pid.
-		foreach ($this->recordedRunPids($runId) as $pid) {
-			$inspectionFailed = false;
-			$commandLine = $this->processCommandLine($pid, $inspectionFailed);
-			$this->assertFalse($inspectionFailed);
-			$this->assertNotNull($commandLine);
-			$this->assertStringContainsString('adversarial_children.py', (string)$commandLine);
+		$identityErrors = [];
+		foreach ($this->recordedRunPids($runId, $identityErrors) as $pid) {
+			$identity = $this->processIdentity($pid, $runId, [], $identityErrors);
+			$this->assertTrue($identity, 'the recorded pid must be identified as OUR adversarial child');
+			$this->assertSame([], $identityErrors);
 		}
 
 		// Bounded cleanup, then gone. The test owns the process handle, so
 		// it must REAP the SIGKILLed child (otherwise it stays a zombie,
 		// which a signal-0 liveness probe legitimately still sees).
-		$this->assertTrue($this->killRunProcesses($runId));
+		$cleanupErrors = [];
+		$this->killRunProcesses($runId, [], $cleanupErrors);
+		$this->assertSame([], $cleanupErrors);
 		usleep(200000);
 		proc_close($process);
 		$deadlineNs = hrtime(true) + 5_000_000_000;
 		do {
-			$gone = ! $this->runHasSurvivors($runId);
+			$gone = $this->runHasSurvivors($runId, [], $cleanupErrors) === false;
+			if ($gone && $cleanupErrors === []) {
+				break;
+			}
+			usleep(100000);
+		} while (hrtime(true) < $deadlineNs);
+		$this->assertFalse($this->runHasSurvivors($runId, [], $cleanupErrors), 'cleanup must leave no signer survivor');
+		$this->assertSame([], $cleanupErrors);
+		@rmdir($runDirectory);
+	}
+
+	/**
+	 * FAULT-INJECTION META-REGRESSIONS: cleanup and inspection failures
+	 * must be REPORTED and must never produce a passing result. Each case
+	 * runs through runIsolatedScenario with an injected fault seam and a
+	 * scenario that otherwise succeeds — so the ONLY reason a result is
+	 * "not clean" is the reported fault.
+	 */
+	public function testCleanupFaultsAreReportedAndNeverPassSilently(): void {
+		$successScenario = function (LocalSignerClient $client, string $runId): void {
+			$credential = $this->credentialByRef('synthetic-rsa-leaf');
+			$pdf = $this->makePdf('cleanup fault meta ' . $runId);
+			$prepared = $this->service->prepare($this->buildContext($pdf, $credential));
+			$record = new ProofOperationRecord('proof-op-' . $runId, $credential['credentialRef']);
+			$record->submit(fn (): \LibreSign\Tools\LocalCardSigningProof\SignerResponse => $client->signPreparedOperation(
+				$record->operationId,
+				$credential['credentialRef'],
+				$credential['certificateSha256'],
+				$prepared->upstream->payload,
+			));
+		};
+
+		// 1. INJECTED INSPECTION FAILURE: cleanup errors are reported even
+		//    though the scenario itself succeeded. Never a clean result.
+		$inspection = $this->runIsolatedScenario('clean_exit', $successScenario, 8.0, faults: ['inspection-fails' => true]);
+		$this->assertSame(0, $inspection['exitcode'], 'the scenario itself must succeed');
+		$this->assertNotSame([], $inspection['cleanupErrors'], 'an injected inspection failure must be reported');
+		$this->assertStringContainsString(
+			'injected inspection failure',
+			(string)$inspection['cleanupErrors'][0],
+		);
+
+		// 2. INJECTED SIGNAL FAILURE: the scenario spawns an EXTRA live
+		//    signer recorded in the SAME run pidfile, so cleanup faces a
+		//    live recorded pid; the injected fault must then be REPORTED
+		//    (never a silent clean result), and the leaked signer is
+		//    cleaned up below without the fault.
+		$signal = $this->runIsolatedScenario('clean_exit', function (LocalSignerClient $client, string $runId) use ($successScenario): void {
+			$successScenario($client, $runId);
+			// Extra live signer recorded into the run's own pidfile dir.
+			$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
+			$process = proc_open(
+				[$this->pythonBinary(), '-B', $this->adversarialScript, 'never_reads', $runId, $runDirectory . '/extra.pids'],
+				[['pipe', 'r'], ['pipe', 'w'], ['file', '/dev/null', 'w']],
+				$pipes,
+			);
+			$this->assertIsResource($process);
+			fclose($pipes[0]);
+			fclose($pipes[1]);
+			$deadlineNs = hrtime(true) + 5_000_000_000;
+			while (! is_file($runDirectory . '/extra.pids') && hrtime(true) < $deadlineNs) {
+				usleep(50000);
+			}
+			$this->assertFileExists($runDirectory . '/extra.pids');
+			// Merge the extra pid into the run's OWN record, so cleanup
+			// and survivor detection see it — otherwise the leaked-signer
+			// assertions below would be vacuous.
+			$extraPid = trim((string)file_get_contents($runDirectory . '/extra.pids'));
+			$this->assertNotSame('', $extraPid);
+			file_put_contents($runDirectory . '/signer.pids', $extraPid . "\n", FILE_APPEND);
+			// OUTSIDE the run dir: the finally path deletes run records,
+			// but the parent must still learn this pid to clean the leak.
+			file_put_contents(sys_get_temp_dir() . '/lcs-meta-extra-' . $runId . '.pid', $extraPid);
+			// The signer stays alive; cleanup (with the injected signal
+			// fault) must report the failure AND still SIGKILL the extra
+			// signer on the second, fault-free attempt in the parent.
+		}, 8.0, faults: ['signal-fails' => true]);
+		$this->assertSame(0, $signal['exitcode'], 'signal meta: ' . implode(' | ', $signal['cleanupErrors']));
+		$this->assertNotSame([], $signal['cleanupErrors'], 'an injected signal failure must be reported');
+		$this->assertStringContainsString('injected signal failure', (string)$signal['cleanupErrors'][0]);
+		// The leak is real: verify the extra signer's identity, kill it by
+		// exact pid (fault-free), and prove it is gone.
+		$errorsAfter = [];
+		$extraPid = (int)trim((string)file_get_contents(sys_get_temp_dir() . '/lcs-meta-extra-' . $signal['runId'] . '.pid'));
+		$this->assertNotSame(0, $extraPid);
+		$this->assertTrue(
+			$this->processIdentity($extraPid, $signal['runId'], [], $errorsAfter),
+			'the leaked signer must still be identified before the parent kills it',
+		);
+		$this->assertSame([], $errorsAfter);
+		$this->assertTrue(posix_kill($extraPid, SIGKILL), 'the leaked signer must accept SIGKILL');
+		$deadlineNs = hrtime(true) + 5_000_000_000;
+		do {
+			$gone = ! posix_kill($extraPid, 0) && posix_get_last_error() === 3;
 			if ($gone) {
 				break;
 			}
 			usleep(100000);
 		} while (hrtime(true) < $deadlineNs);
-		$this->assertFalse($this->runHasSurvivors($runId), 'cleanup must leave no signer survivor');
+		$this->assertTrue($gone, 'the leaked signer must be dead after the parent cleanup');
+		@unlink(sys_get_temp_dir() . '/lcs-meta-extra-' . $signal['runId'] . '.pid');
+
+		// 3. INJECTED WAIT FAILURE: the wait failure is reported; signer
+		//    cleanup still runs afterwards.
+		$wait = $this->runIsolatedScenario('clean_exit', $successScenario, 8.0, faults: ['wait-fails' => true]);
+		$this->assertTrue($wait['waitError'], 'an injected wait failure must be reported');
+
+		// 4. INJECTED PID REUSE / ANOTHER RUN: a recorded pid whose live
+		//    command line carries a DIFFERENT run token must never be
+		//    signalled, and the mismatch must be reported.
+		$reuse = $this->runIsolatedScenario('clean_exit', $successScenario, 8.0, faults: [
+			'identity-cmdline' => 'adversarial_children.py some-OTHER-run-token',
+		]);
+		$this->assertSame(0, $reuse['exitcode']);
+		$this->assertNotSame([], $reuse['cleanupErrors'], 'a foreign-command-line pid must be reported, never signalled');
+		$this->assertStringContainsString('deliberately NOT signalled', (string)$reuse['cleanupErrors'][0]);
+	}
+
+	/**
+	 * Two SIMULTANEOUS runs: cleanup of run A must not affect run B, and
+	 * B must remain a detected, separately cleanable survivor.
+	 */
+	public function testCleanupOnlyAffectsItsOwnRun(): void {
+		$spawn = function (string $runId) use (&$handles): int {
+			$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
+			mkdir($runDirectory, 0700, true);
+			$pidfilePath = $runDirectory . '/signer.pids';
+			$process = proc_open(
+				[$this->pythonBinary(), '-B', $this->adversarialScript, 'never_reads', $runId, $pidfilePath],
+				[['pipe', 'r'], ['pipe', 'w'], ['file', '/dev/null', 'w']],
+				$pipes,
+			);
+			fclose($pipes[0]);
+			fclose($pipes[1]);
+			$handles[$runId] = $process;
+			$deadlineNs = hrtime(true) + 5_000_000_000;
+			while (! is_file($pidfilePath) && hrtime(true) < $deadlineNs) {
+				usleep(50000);
+			}
+			$this->assertFileExists($pidfilePath);
+
+			return 0;
+		};
+		$handles = [];
+		$runA = 'adv-runA-' . uniqid();
+		$runB = 'adv-runB-' . uniqid();
+		$spawn($runA);
+		$spawn($runB);
+		$errorsA = [];
+		$errorsB = [];
+		$this->assertTrue($this->runHasSurvivors($runA, [], $errorsA));
+		$this->assertTrue($this->runHasSurvivors($runB, [], $errorsB));
+
+		$this->killRunProcesses($runA, [], $errorsA);
+		$this->assertSame([], $errorsA);
+		proc_close($handles[$runA]); // reap the SIGKILLed child
+		$deadlineNs = hrtime(true) + 5_000_000_000;
+		do {
+			$aGone = $this->runHasSurvivors($runA, [], $errorsA) === false;
+			if ($aGone && $errorsA === []) {
+				break;
+			}
+			usleep(100000);
+		} while (hrtime(true) < $deadlineNs);
+		$this->assertFalse($this->runHasSurvivors($runA, [], $errorsA), 'run A must be cleaned');
+		$this->assertSame([], $errorsA);
+		$this->assertTrue($this->runHasSurvivors($runB, [], $errorsB), 'run B must be unaffected by run A cleanup');
+
+		$this->killRunProcesses($runB, [], $errorsB);
+		$this->assertSame([], $errorsB);
+		proc_close($handles[$runB]);
+		$this->assertFalse($this->runHasSurvivors($runA, [], $errorsA));
+		$this->assertFalse($this->runHasSurvivors($runB, [], $errorsB));
+	}
+
+	/**
+	 * SUBSTITUTED RECORD: a pidfile that records OUR OWN pid (the
+	 * checking process) must be reported as a mismatch and must NEVER be
+	 * signalled — the checker cannot kill itself via its own records.
+	 */
+	public function testSubstitutedRecordIsReportedAndNeverSignalled(): void {
+		$runId = 'adv-subst-' . uniqid();
+		$runDirectory = sys_get_temp_dir() . '/lcs-proof-' . $runId;
+		mkdir($runDirectory, 0700, true);
+		file_put_contents($runDirectory . '/signer.pids', (string)getmypid() . "\n");
+		$errors = [];
+		$this->assertNotFalse($this->runHasSurvivors($runId, [], $errors) ?? true);
+		$this->assertNotSame([], $errors, 'a substituted record must be reported');
+		$this->killRunProcesses($runId, [], $errors);
+		$this->assertNotSame([], $errors, 'the mismatch must be reported by cleanup as well');
+		$this->assertTrue(
+			posix_kill(getmypid(), 0),
+			'the checking process must never be signalled, even via a substituted record',
+		);
+		@unlink($runDirectory . '/signer.pids');
 		@rmdir($runDirectory);
 	}
 

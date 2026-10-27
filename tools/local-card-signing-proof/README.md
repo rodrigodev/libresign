@@ -237,18 +237,28 @@ Proof-specific Psalm analysis: the application's `psalm.xml` analyzes
 A committed generator creates a temporary proof-specific config whose
 `projectFiles` are exactly the PHP the proof adds
 (`tools/local-card-signing-proof/harness/`,
-`tests/php/Integration/Tools/`); `extraFiles` resolve the dependencies
+`tests/php/Integration/Tools/` AND the generator itself,
+`psalm/generate-config.php`); `extraFiles` resolve the dependencies
 (app `lib/`, Nextcloud server `lib/`, server `tests/lib/`, the
 integration `TestCase`, the app `AppConfigOverwrite` helper and the
-#9216 subprocess infrastructure). A minimal committed PHPUnit stub
-(`psalm/phpunit-testcase.phpstub`) provides parent-chain RESOLUTION
-only — the analysis process does not load PHPUnit classes, so
-behavioral typing of inherited test helpers is limited by design. The
-production `psalm.xml`, baseline and error level are never modified
-and no suppressions are added.
+#9216 subprocess infrastructure).
 
-One exact command (from the APP checkout, PHP >= 8.3, Psalm from
-`vendor-bin/psalm`):
+PHPUnit preference, implemented and verified: the generator probes the
+APP's composer autoloader (the one Psalm loads automatically). When
+`PHPUnit\Framework\TestCase` is loadable through it, REAL PHPUnit
+definitions are used and NO stub is emitted. In the common Nextcloud
+layout PHPUnit lives in `vendor-bin/` outside that autoloader; the
+generator then emits the minimal committed stub
+(`psalm/phpunit-testcase.phpstub`). The stub provides parent-chain
+RESOLUTION only, so behavioral typing of inherited test helpers is
+limited by design; the chosen mode is printed by the generator and
+recorded in the generated comment. Paths are XML-escaped, so app or
+server roots containing spaces and XML-special characters (`&`, `<`)
+produce a valid configuration. The production `psalm.xml`, baseline and
+error level are never modified and no suppressions are added.
+
+One exact command (from the APP checkout; Psalm 6.x runs on PHP >= 8.1
+— these checks used PHP 8.3 with Psalm 6.20.1 from `vendor-bin/psalm`):
 
 ```bash
 php tools/local-card-signing-proof/psalm/generate-config.php \
@@ -263,3 +273,27 @@ must not be committed. php-cs-fixer runs over the same added paths.
 The `tools/` PHP harness is NOT part of the application autoloader and
 is loaded explicitly by the test. Recorded results, exit codes and
 subset-scan diagnostics are in the handoff reports.
+
+## Process containment: guarantees and limits
+
+Cleanup scope is exactly two things: the isolated test child and the
+signer processes recorded for the CURRENT run. Identity is
+`adversarial_children.py`/`local_signer.py` script path AND the
+per-run token present in the process command line, taken from
+run-specific pidfiles under a per-run temporary directory. Records that
+are missing, malformed, stale (ESRCH), unreadable, or that point at the
+checking process itself are reported as errors — never signalled and
+never treated as a clean result.
+
+Remaining races and platform limits, stated plainly:
+
+- Identity-then-signal is still a check-then-act sequence: a pid could
+  in principle be recycled between the identity check and `posix_kill`.
+  The pidfile records are removed in the same `finally` path that
+  performs cleanup, which narrows but does not eliminate this window.
+- `ps` failures (as reproduced on the reviewer's constrained Linux) are
+  treated as inspection ERRORS; such an environment yields unknown
+  cleanup outcomes, not green results.
+- A leaked signer after an unconfirmed termination (documented in the
+  harness class) is NOT contained by this machinery; only the external
+  timeout context bounds it.
