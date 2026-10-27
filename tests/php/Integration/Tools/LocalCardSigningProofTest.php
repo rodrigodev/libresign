@@ -754,7 +754,7 @@ final class LocalCardSigningProofTest extends TestCase {
 			"the $behavior scenario must clean up without errors",
 		);
 		$this->assertFalse(
-			(bool)$result['survivors'],
+			$result['survivors'],
 			"child processes survived cleanup for run {$result['runId']} (null = unknown, also a failure)",
 		);
 	}
@@ -849,6 +849,7 @@ final class LocalCardSigningProofTest extends TestCase {
 		$reaped = false;
 		$waitError = false;
 		$watchdogFired = false;
+		$childKnownRunning = false;
 		try {
 			while (hrtime(true) < $outerDeadlineNs) {
 				$waited = pcntl_waitpid($childPid, $childStatus, \WNOHANG);
@@ -857,9 +858,11 @@ final class LocalCardSigningProofTest extends TestCase {
 					break;
 				}
 				if ($waited === -1) {
+					$childKnownRunning = false;
 					$waitError = true;
 					break;
 				}
+				$childKnownRunning = true;
 				if (! empty($faults['wait-fails'])) {
 					// INJECTED wait failure: behave exactly as if waitpid
 					// had returned -1, then prove cleanup still runs and
@@ -869,11 +872,14 @@ final class LocalCardSigningProofTest extends TestCase {
 				}
 				usleep(50000);
 			}
-			if (! $reaped && ! $waitError) {
+			if (! $reaped && (! $waitError || $childKnownRunning)) {
+				// On timeout or an injected wait failure with a known live child,
+				// terminate and reap without blocking. A real waitpid error does
+				// not establish ownership, so it must not trigger a blind kill.
 				// Outer watchdog fired: kill recorded signer processes, then
 				// the isolated test child, then reap with a BOUNDED
 				// nonblocking poll. No unbounded wait anywhere.
-				$watchdogFired = true;
+				$watchdogFired = ! $waitError;
 				$this->killRunProcesses($runId, $faults, $cleanupErrors);
 				$this->signalProcess($childPid, 9, $faults, $cleanupErrors, 'isolated test child');
 				$reapDeadlineNs = hrtime(true) + 5_000_000_000;
@@ -889,7 +895,7 @@ final class LocalCardSigningProofTest extends TestCase {
 					}
 					usleep(50000);
 				} while (hrtime(true) < $reapDeadlineNs);
-				if (! $reaped && ! $waitError) {
+				if (! $reaped) {
 					$cleanupErrors[] = 'the isolated test child could not be reaped within the bounded cleanup window';
 				}
 			}
@@ -915,11 +921,14 @@ final class LocalCardSigningProofTest extends TestCase {
 		}
 
 		if ($waitError) {
+			if (! $reaped) {
+				$cleanupErrors[] = 'isolated child ownership or termination could not be confirmed after wait failure';
+			}
 			return [
 				'exitcode' => -1, 'signaled' => false, 'signal' => null,
 				'timedOut' => false, 'survivors' => $survivorsFinal, 'runId' => $runId,
 				'detail' => 'pcntl_waitpid failed', 'waitError' => true,
-				'cleanupErrors' => $cleanupErrors,
+				'cleanupErrors' => $cleanupErrors, 'childReaped' => $reaped,
 			];
 		}
 
@@ -1550,10 +1559,6 @@ final class LocalCardSigningProofTest extends TestCase {
 		$this->assertTrue($gone, 'the leaked signer must be dead after the parent cleanup');
 		@unlink(sys_get_temp_dir() . '/lcs-meta-extra-' . $signal['runId'] . '.pid');
 
-		// 3. INJECTED WAIT FAILURE: the wait failure is reported; signer
-		//    cleanup still runs afterwards.
-		$wait = $this->runIsolatedScenario('clean_exit', $successScenario, 8.0, faults: ['wait-fails' => true]);
-		$this->assertTrue($wait['waitError'], 'an injected wait failure must be reported');
 
 		// 4. INJECTED PID REUSE / ANOTHER RUN: a recorded pid whose live
 		//    command line carries a DIFFERENT run token must never be
@@ -1564,6 +1569,17 @@ final class LocalCardSigningProofTest extends TestCase {
 		$this->assertSame(0, $reuse['exitcode']);
 		$this->assertNotSame([], $reuse['cleanupErrors'], 'a foreign-command-line pid must be reported, never signalled');
 		$this->assertStringContainsString('deliberately NOT signalled', (string)$reuse['cleanupErrors'][0]);
+	}
+
+	/** A wait failure must not leave the known-live isolated child behind. */
+	public function testWaitFailureTerminatesAndReapsKnownChild(): void {
+		$wait = $this->runIsolatedScenario('clean_exit', static function (): void {
+			sleep(3600);
+		}, 8.0, faults: ['wait-fails' => true]);
+		$this->assertTrue($wait['waitError']);
+		$this->assertTrue($wait['childReaped'], 'the live isolated child must be terminated and reaped');
+		$this->assertSame([], $wait['cleanupErrors']);
+		$this->assertFalse($wait['survivors']);
 	}
 
 	/**
