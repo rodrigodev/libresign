@@ -1559,7 +1559,6 @@ final class LocalCardSigningProofTest extends TestCase {
 		$this->assertTrue($gone, 'the leaked signer must be dead after the parent cleanup');
 		@unlink(sys_get_temp_dir() . '/lcs-meta-extra-' . $signal['runId'] . '.pid');
 
-
 		// 4. INJECTED PID REUSE / ANOTHER RUN: a recorded pid whose live
 		//    command line carries a DIFFERENT run token must never be
 		//    signalled, and the mismatch must be reported.
