@@ -873,6 +873,9 @@ final class LocalCardSigningProofTest extends TestCase {
 				usleep(50000);
 			}
 			if (! $reaped && (! $waitError || $childKnownRunning)) {
+				// TODO(#8356): Before using this harness in shared CI, investigate
+				// safe containment and operator cleanup for real waitpid errors
+				// where child ownership or termination cannot be confirmed.
 				// On timeout or an injected wait failure with a known live child,
 				// terminate and reap without blocking. A real waitpid error does
 				// not establish ownership, so it must not trigger a blind kill.
@@ -995,6 +998,9 @@ final class LocalCardSigningProofTest extends TestCase {
 				continue; // already gone
 			}
 			if ($identity === true) {
+				// TODO(#8356): Before shared CI use, address the PID reuse race
+				// between this identity check and signalling, and validate the
+				// chosen containment on Linux and macOS.
 				$this->signalProcess($pid, 9, $faults, $errors, 'recorded signer ' . $pid);
 			}
 			// identity === false: the pid exists but is NOT our child (PID
